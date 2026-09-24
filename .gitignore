@@ -1,0 +1,10 @@
+# 游戏配音素材（爱莉希雅语音片段）—— 版权不属于本项目，不随仓库分发。
+# 需要声线素材请到原作者处获取，见 README 的「来源说明」。
+*.wav
+voice-clips/
+
+# 安装/运行时的本地产物
+node_modules/
+tasks/
+*.log
+reply-cursor.json

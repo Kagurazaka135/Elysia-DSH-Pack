@@ -1,0 +1,7 @@
+# dsh-qq-bridge bundle patch: mounts the QQ injection bridge.
+#
+# Config fields are overridden from the profile's own cordis.patch.yml
+# (id-targeted), so secrets like `token` never live in this shipped layer.
+- insert:
+    - id: dsh-qq-bridge
+      name: 'dsh-qq-bridge'
