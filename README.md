@@ -4,24 +4,22 @@
 > 人格 + QQ 接入打包成一键安装，给不想碰命令行的人用。
 
 装完之后，爱莉在浏览器（`http://127.0.0.1:3080`）和 QQ 里都能陪你聊天，还能读写文件、跑命令干活。
+再装一个（可选的）视频包，网页里的爱莉还能"看"视频。
 
 ---
 
 ## ⚠️ 来源说明（先看这段）
 
-**这不是原创项目，是基于 B 站上流传的一份整合包做的魔改。**
+**这不是原创项目，是从一份在 B 站一带流传的整合包魔改来的。**
 
-那份原包把「dsh 本体 + 爱莉希雅人格 + QQ 接入」打包成小白一键安装版，在 B 站流传。
-**但它本身的作者是谁、是不是也从别处搬来的，本仓库无法确认** ——
-所以这里**不标注具体作者名**，免得张冠李戴（把一个转载者说成原作者，也是一种失实）。
+那份包把「dsh 本体 + 爱莉希雅人格 + QQ 接入」打包成小白一键安装版，在网上流传。
+**再往上的最初作者已经查不到了** —— 所以这里**不标注任何具体作者名**，免得张冠李戴
+（把转载者说成原作者，同样是一种失实）。想找原始版本，B 站站内搜「**DeepSeek 爱莉希雅 整合包**」试试。
 
-想找原包，B 站站内搜「**DeepSeek 爱莉希雅 整合包**」这类关键词试试。
+本仓库只对**自己改动的部分**负责，而改动其实不小：适配新版 dsh、重写 QQ 桥、新增视频包……
+现在这份跟原包**已经差别很大了**（详见下面「这个改版改了什么」）。
 
-本仓库只对**代码适配部分**负责，主要做的是两件事：
-
-1. **适配到 `dsh 0.1.6-alpha.2`** —— 原包是给 `0.1.1-rc.2` 写的，直接装到新版**跑不起来**：
-   新版移除了 `cordis_define`（原插件靠它贴进会话），预设里也有两行引用了已改名的包。
-2. **重写 QQ 桥插件** —— 从「贴进会话的代码片段」改成标准的 dsh bundle 插件，并换了回复通道。
+**如果你是原作者，或知道上游是谁 —— 欢迎开 Issue 联系**，署名怎么算都可以谈。
 
 **本仓库不包含的东西：**
 
@@ -35,21 +33,76 @@
 
 ## 装什么
 
-三个包，按顺序装：
+四个包，按顺序装：
 
 | 包 | 作用 | 必须？ |
 |---|---|---|
 | **`elysia-pkg1-core.zip`** | 装 Node.js → `npm install -g @deepseek-ai/dsh@0.1.6-alpha.2` → 收 API Key → 后台起 `dsh web` → 生成桌面启动器 | ✅ 必须 |
 | **`elysia-pkg2-elysia.zip`** | 装爱莉人格预设，设为默认 | 推荐 |
 | **`elysia-pkg3-qq.zip`** | 接 QQ（需自备 [NapCat](https://github.com/NapNeko/NapCatQQ)） | 可选 |
+| **`elysia-pkg4-video.zip`** | 视频理解：内容总结 / 抽帧 / 场景检测 / GIF / 元数据（需自备 [ffmpeg](https://www.gyan.dev/ffmpeg/builds/)，脚本会检查并给指引） | 可选 |
 
 ### 安装
 
 1. 解压 `packages/` 里的 **`elysia-pkg1-core.zip`**，双击里面的 `install.bat`
 2. （推荐）同理解压并双击 `elysia-pkg2-elysia.zip`
 3. （可选）同理解压 `elysia-pkg3-qq.zip` 并双击——需要先自己下载 NapCat
+4. （可选）同理解压 `elysia-pkg4-video.zip` 并双击——机器上最好先装好 ffmpeg，
+   没装脚本也会停下来给指引（推荐 `winget install Gyan.FFmpeg`）
 
 每个包里都有一份 `README.md` 写详细步骤。
+
+---
+
+## 架构一览
+
+一张图看懂装完之后各部件怎么连（`dsh web` 是内核，四个包往它上面叠）：
+
+```mermaid
+flowchart TB
+    B["浏览器"]
+    QQ["QQ 用户"]
+
+    subgraph DSH["dsh web · :3080 · profile: web"]
+        BR["dsh-qq-bridge<br/>(pkg3)"]
+        VF["dsh-video-frames<br/>(pkg4)"]
+        AG["爱莉 agent<br/>(preset: elysia)"]
+    end
+
+    NC["NapCat · OneBot 11<br/>(WS :3001)"]
+    PY["qq-elysia.py"]
+    FF["ffmpeg / ffprobe"]
+    LLM["DeepSeek API"]
+
+    B -->|"网页对话"| AG
+    QQ -->|"QQ 消息"| NC
+    NC <-->|"WebSocket"| PY
+    PY <-->|"HTTP /api/qq/*"| BR
+    BR --> AG
+    AG -->|"调工具"| VF
+    VF -->|"抽帧"| FF
+    AG -->|"每回合"| LLM
+```
+
+- **浏览器面**：直接和爱莉对话，能读写文件、跑命令（内核自带的能力）。
+- **QQ 面**（pkg3）：QQ 消息经 NapCat 转成 OneBot 协议 → `qq-elysia.py` 转发进 `dsh web` → 爱莉的回复再原路发回 QQ。
+- **视频线**（pkg4）：爱莉调 `video_analyze` → `ffmpeg` 抽关键帧 → 喂视觉模型 → 返回画面描述。
+- **大脑**：所有回合最终都打到 DeepSeek API（装了 pkg4 时，总结画面用的是支持图像的 `deepseek-flash`）。
+
+**四个包分别叠在哪：**
+
+```
+web profile 的 bundle 栈（从上到下即加载顺序）：
+
+  dsh-base                ← dsh 内核自带
+  dsh-web-app             ← 网页界面，dsh 自带
+  dsh-qq-bridge           ← pkg3 装的
+  dsh-video-frames        ← pkg4 装的
+  profiles/web/cordis.patch.yml   ← 覆盖层（安装脚本写 agentPreset / cwd 等）
+
+pkg1 = 把 dsh 本体 + web profile 装上、收 API Key、起服务
+pkg2 = 往 ~/.dsh/.agent-presets/ 塞「爱莉」人格预设，并设为默认
+```
 
 ---
 
@@ -98,25 +151,41 @@
 - **人格包没装时，QQ 桥会整个崩掉** —— 预设挂载失败会连带回滚 agent 创建，现在降级成默认预设继续跑。
 - **纯图片消息会收到误导提示**（"连接有点问题"）—— 现在如实回"看不见图片"。
 
+### 包4 · 视频包（本仓库新增）
+
+不是改原包，是**新增**：把独立插件 **dsh-video-frames**（未发布到 npm）打包成第 4 个安装包，
+给纯文本的爱莉补上视频理解——抽帧 / 场景检测 / GIF / 元数据 / 视觉模型总结画面。
+
+- **真机实测通过（5/5 工具）**：`video_analyze` 抽帧 → 喂视觉模型 → 返回**真实画面描述**
+  （不是"看不到图"那种降级回复），其余四个工具逐一出真实产物（元数据 / 帧 / 切点 / GIF）。
+- 安装脚本照包3 的路子（复制 → `npm install` → `dsh plugin add`），
+  外加 **ffmpeg / ffprobe 的检查与指引**：只提示不自动装；还会识别 **2013 年那种能跑、但解不动手机 HEVC 的上古版本**。
+- **只在网页面可用**——QQ 桥不支持传视频。
+
 ---
 
 ## 已知限制
 
 - **图片**：不支持。发图片会被忽略，爱莉只看得见文字。
+- **视频**：装了包4 才有，且**只在网页面**可用（QQ 桥不支持传图片/视频）；机器上需要有 `ffmpeg` 在 PATH
+  （**太老的版本解不动手机拍的 HEVC**，建议从 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 装新版）。
 - **语音**：需要额外装 CosyVoice（约 3GB）+ ffmpeg。没装时**文字照发**，只是没有语音条。
 - **只在 v0.1.6-alpha.2 上测过**，其他版本没验证。
-- 在**模拟环境**（全新 DSH_HOME + NapCat 模拟器）端到端验证通过，**未在真 QQ 上实跑过**。
+- 验证口径：包1/2/3 在**模拟环境**（全新 DSH_HOME + NapCat 模拟器）端到端通过；
+  包4 在**真 `dsh web`** 上加载无报错、工具真出结果（含 `video_analyze` 出真实画面描述）。
+  **全部未在真 QQ 上实跑过**（需真人扫码登录，无法自动模拟）。
 
 ---
 
 ## 目录结构
 
 ```
-packages/            # 三个可直接下载的安装包（解压双击 install.bat 即可）
+packages/            # 四个可直接下载的安装包（解压双击 install.bat 即可）
 src/                 # 同一份内容展开成源码，给想改/想审查的人
 ├── pkg1-core/
 ├── pkg2-elysia/
-└── pkg3-qq/
+├── pkg3-qq/
+└── pkg4-video/
 ```
 
 `src/` 里每个包的 `setup.ps1` 是把 `install.bat` 里 base64 打包的 PowerShell **解码后的可读版本** ——

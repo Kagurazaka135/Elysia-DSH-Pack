@@ -1,0 +1,5 @@
+# dsh-video-frames bundle patch: mounts the video frame extraction plugin.
+# The plugin registers five tools (video_info / video_scenes / video_gif / video_frames / video_analyze).
+- insert:
+    - id: dsh-video-frames
+      name: 'dsh-video-frames'
