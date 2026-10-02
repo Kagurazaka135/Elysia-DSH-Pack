@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """爱莉 QQ 机器人 v4 (真身直答版)
-收到消息 -> 转发真身(注入桥 followup 唤醒) -> 轮询 reply.json -> 真身回复发回 QQ (文字+语音)
+收到消息 -> 转发真身(注入桥 followup 唤醒) -> 轮询回复接口 -> 真身回复发回 QQ (文字+语音)
 分身不再自己调用模型回复, 所有回答都来自真身完整思考
 """
-import os, sys, json, time, base64, io, wave, re, threading
+import os, sys, json, time, base64, io, wave, re
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -11,22 +11,66 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(BASE, 'qq-elysia.log')
-PENDING = os.path.join(BASE, 'tasks', 'pending.json')
 DONE = os.path.join(BASE, 'tasks', 'done.json')
 os.makedirs(os.path.join(BASE, 'tasks'), exist_ok=True)
 
 WS_URL = 'ws://127.0.0.1:3001'
 INJECT_URL = 'http://127.0.0.1:3080/api/qq/inject'
 REPLY_URL = 'http://127.0.0.1:3080/api/qq/replies'
-# 新版桥是 bundle 插件, 注入和取回复都可以带共享口令。
-# 留空 = 两边都不校验, 跟插件的 token 默认值对齐 —— 只监听 127.0.0.1, 本机自用够。
-TOKEN = ''
 
 def log(msg):
     line = f'[{time.strftime("%H:%M:%S")}] {msg}'
     with open(LOG, 'a', encoding='utf-8') as f:
         f.write(line + '\n')
     print(line, flush=True)
+
+# ---------- 共享配置 (安装脚本生成的 qq-config.json, 跟 profile / NapCat 用同一份值) ----------
+QQ_CONFIG_PATH = os.path.join(BASE, 'qq-config.json')
+
+def load_qq_config():
+    """读共享配置。文件缺失/损坏 = 各项按空处理 (白名单空 = 全拦, 见 main 的警告)。"""
+    cfg = {'inject_token': '', 'ws_token': '',
+           'allowed_users': set(), 'allowed_group_ids': set(), 'bot_qq': ''}
+    try:
+        with open(QQ_CONFIG_PATH, encoding='utf-8-sig') as f:
+            raw = json.load(f)
+    except Exception:
+        return cfg
+    def _ids(key):
+        val = raw.get(key) or []
+        if isinstance(val, (str, int)):        # 容忍安装脚本把单元素数组写成标量
+            val = [val]
+        return {int(x) for x in val if str(x).strip().isdigit()}
+    cfg['inject_token'] = str(raw.get('inject_token') or '')
+    cfg['ws_token'] = str(raw.get('ws_token') or '')
+    cfg['allowed_users'] = _ids('allowed_users')
+    cfg['allowed_group_ids'] = _ids('allowed_group_ids')
+    cfg['bot_qq'] = str(raw.get('bot_qq') or '')
+    return cfg
+
+CFG = load_qq_config()
+# 新版桥是 bundle 插件, 注入和取回复都可以带共享口令 (P0-1)。
+# 留空 = 两边都不校验, 跟插件的 token 默认值对齐 —— 只监听 127.0.0.1, 本机自用够。
+TOKEN = CFG['inject_token']
+# OneBot WebSocket 口令 (P0-3): 与 NapCat onebot11.json 里的 token 一致; 空 = 连接时不带。
+WS_TOKEN = CFG['ws_token']
+# 发送者白名单 (P0-2): 不在名单里的 QQ 号一律拦截。fail-closed: 名单为空 = 全拦。
+ALLOWED_USERS = CFG['allowed_users']
+# 群白名单 (可选): 配了就只回这些群; 空 = 不限群 (群内发送者仍要过 ALLOWED_USERS)。
+ALLOWED_GROUP_IDS = CFG['allowed_group_ids']
+# 爱莉小号的 QQ 号 (群里 @ 判定用); 没配就沿用老版本的写死值。
+BOT_QQ = CFG['bot_qq'] or '2778339130'
+
+# ffmpeg 解析 (P1-3): 系统 PATH 优先, 其次 <本目录>\bin\ffmpeg.exe; 都没有 = 语音不可用。
+def find_ffmpeg():
+    import shutil
+    p = shutil.which('ffmpeg')
+    if p:
+        return p
+    local = os.path.join(BASE, 'bin', 'ffmpeg.exe')
+    return local if os.path.exists(local) else None
+
+FFMPEG = find_ffmpeg()
 
 def load_json(path):
     if os.path.exists(path):
@@ -40,8 +84,8 @@ def save_json(path, data):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def forward_to_host(text, user_id, group_id=None, images=None):
-    """转发给真身, 返回 sessionId; images 为本地图片路径列表 (新版桥暂不吃图片)"""
+def forward_to_host(text, user_id, group_id=None):
+    """转发给真身, 返回 sessionId"""
     import urllib.request
     body = json.dumps({'text': text, 'userId': user_id, 'groupId': group_id or '',
                        'token': TOKEN}).encode()
@@ -108,12 +152,13 @@ def tts_wav(text, prompt_wav, prompt_text, speed=1.0):
 def wav_to_amr_base64(wav_bytes):
     """wav -> mp3 (NapCat 支持 mp3 语音) -> base64"""
     import subprocess, tempfile
+    if not FFMPEG:
+        raise RuntimeError('找不到 ffmpeg (系统 PATH 和 本目录\\bin 都没有), 语音不可用')
     tmp_wav = os.path.join(tempfile.gettempdir(), 'elys_send.wav')
     tmp_mp3 = os.path.join(tempfile.gettempdir(), 'elys_send.mp3')
     with open(tmp_wav, 'wb') as f:
         f.write(wav_bytes)
-    ffmpeg = os.path.join(BASE, 'bin', 'ffmpeg.exe')
-    subprocess.run([ffmpeg, '-y', '-i', tmp_wav, '-ar', '44100', '-ac', '1', '-b:a', '64k', tmp_mp3],
+    subprocess.run([FFMPEG, '-y', '-i', tmp_wav, '-ar', '44100', '-ac', '1', '-b:a', '64k', tmp_mp3],
                    capture_output=True, timeout=60)
     with open(tmp_mp3, 'rb') as f:
         return base64.b64encode(f.read()).decode()
@@ -208,10 +253,10 @@ async def poll_replies(ws):
                             log('[语音] 已发送')
                         except Exception as e:
                             log(f'[语音失败·仅文字已发] {type(e).__name__}: {e}')
-                    # 完成后通知 (done.json 兼容旧汇报)
+                    # 完成后通知 (done.json 兼容旧汇报); 封顶 200 条, 别无限涨
                     done = load_json(DONE)
                     done.append({'result': reply, 'time': time.strftime('%H:%M')})
-                    save_json(DONE, done)
+                    save_json(DONE, done[-200:])
                 since = max(since, data.get('nextSeq', 0))
         except Exception as e:
             log(f'[轮询错误] {e}')
@@ -225,10 +270,35 @@ import threading as _th
 LAST_MSG = {}
 DEDUP_LOCK = _th.Lock()
 
+def dedup_is_repeat(key):
+    """True = 10 秒内的重复消息。顺手清掉 10 分钟前的旧记录, 去重表不会无限涨。"""
+    now = time.time()
+    with DEDUP_LOCK:
+        if key in LAST_MSG and now - LAST_MSG[key] < 10:
+            return True
+        LAST_MSG[key] = now
+        if len(LAST_MSG) > 1000:
+            for k in [k for k, t in LAST_MSG.items() if now - t > 600]:
+                del LAST_MSG[k]
+        # 10 分钟内刷出上千条不同消息的极端情况: 硬上限兜底, 逐出最旧的
+        while len(LAST_MSG) > 1000:
+            del LAST_MSG[min(LAST_MSG, key=LAST_MSG.get)]
+        return False
+
 async def handle_message(ws, msg):
     user_id = msg.get('user_id')
     mtype = msg.get('message_type')
     group_id = msg.get('group_id')
+
+    # 白名单 (P0-2): 先拦人, 连去重都不用为陌生人做。
+    # 不回话 —— 回了反而给陌生人一个探测面, 让他知道这儿有个 bot。
+    if user_id not in ALLOWED_USERS:
+        log(f'[拦截] 非白名单用户 {user_id} ({"group:"+str(group_id) if group_id else "private"}), 丢弃')
+        return
+    if mtype == 'group' and ALLOWED_GROUP_IDS and group_id not in ALLOWED_GROUP_IDS:
+        log(f'[拦截] 非白名单群 {group_id}, 丢弃')
+        return
+
     text = ''
     is_at_me = False
     image_urls = []
@@ -241,67 +311,37 @@ async def handle_message(ws, msg):
                 image_urls.append(url)
         elif seg.get('type') == 'at':
             qq = seg.get('data', {}).get('qq')
-            if qq == '2778339130' or qq == 'all':
+            if qq == BOT_QQ or qq == 'all':
                 is_at_me = True
     text = text.strip()
     if not text and not image_urls:
         return
 
     # 去重: 10 秒内同一用户相同消息只处理一次 (加锁防并发穿透)
-    dedup_key = f'{user_id}:{group_id}:{text}'
-    now = time.time()
-    with DEDUP_LOCK:
-        if dedup_key in LAST_MSG and now - LAST_MSG[dedup_key] < 10:
-            log(f'[去重] 忽略重复消息: {text[:30]}')
-            return
-        LAST_MSG[dedup_key] = now
+    if dedup_is_repeat(f'{user_id}:{group_id}:{text}'):
+        log(f'[去重] 忽略重复消息: {text[:30]}')
+        return
 
     # 群聊: 只有被 @ 才响应
     if mtype == 'group' and not is_at_me:
         return
 
-    # 下载图片 -> 压缩到 400px (省 token) -> 保存本地
-    local_images = []
+    # 暂不支持看图: 消息里的图片一律不下载。旧版会 urlretrieve 任意 URL ——
+    # 纯属 SSRF 面, 而且下回来也没人用。二阶段做图片支持时, 带上腾讯 CDN
+    # 域名白名单 (multimedia.nt.qq.com.cn / gchat.qpic.cn) 再加回来。
     if image_urls:
-        import urllib.request
-        import subprocess
-        for i, url in enumerate(image_urls[:3]):
-            try:
-                img_dir = os.path.join(BASE, 'tasks', 'qq-images')
-                os.makedirs(img_dir, exist_ok=True)
-                raw_path = os.path.join(img_dir, f'raw_{int(time.time())}_{i}.jpg')
-                urllib.request.urlretrieve(url, raw_path)
-                # 压缩到 400px, q=8 (约 15-30KB, token 大减)
-                img_path = os.path.join(img_dir, f'qq_{int(time.time())}_{i}.jpg')
-                ffmpeg = os.path.join(BASE, 'bin', 'ffmpeg.exe')
-                subprocess.run([ffmpeg, '-y', '-i', raw_path, '-vf', 'scale=400:-1', '-q:v', '8', img_path],
-                               capture_output=True, timeout=30)
-                os.remove(raw_path)
-                if os.path.exists(img_path) and os.path.getsize(img_path) > 500:
-                    local_images.append(img_path)
-                    log(f'[图片] 已下载+压缩 {img_path} ({os.path.getsize(img_path)}B)')
-                else:
-                    # 压缩失败则用原图
-                    urllib.request.urlretrieve(url, img_path)
-                    local_images.append(img_path)
-                    log(f'[图片] 压缩失败用原图 {img_path}')
-            except Exception as e:
-                log(f'[图片下载失败] {e}')
+        log(f'[图片] 忽略 {len(image_urls)} 张 (暂不支持看图, 不下载)')
 
-    # 新版桥还不吃图片: 纯图片消息没有文字可转, 说明白就行。
-    # 不拦的话它会带着空 text 转发 -> 桥返回 400 -> 用户收到"连接有点问题", 那是误导。
-    # 判据是 text 为空 —— 上面已经拦掉"文字和图片都没有"的情况, 走到这儿说明本来就带了图
-    # (图下载失败也一样, 反正都没有文字可转)。
+    # 纯图片消息没有文字可转, 说明白就行。不拦的话它会带着空 text 转发
+    # -> 桥返回 400 -> 用户收到"连接有点问题", 那是误导。
     if not text:
         log(f'[图片] {user_id} 只发了图, 当前不支持')
         await send_text(ws, user_id, '呜…爱莉现在还没长出眼睛，看不见图片呢。发文字给爱莉好不好？', group_id)
         return
 
-    if local_images:
-        log(f'[图片] 桥暂不支持图片, 本次只转发文字 ({len(local_images)} 张被忽略)')
-    log(f'[收到→真身] {user_id} ({"group:"+str(group_id) if group_id else "private"}): {text} 图片x{len(local_images)}')
+    log(f'[收到→真身] {user_id} ({"group:"+str(group_id) if group_id else "private"}): {text}')
     try:
-        msg_id = forward_to_host(text, user_id, group_id, local_images)
+        msg_id = forward_to_host(text, user_id, group_id)
         log(f'[已转发] msgId={msg_id}')
         await send_text(ws, user_id, '嗯哼～爱莉收到啦，正在认真看哦，稍等一下下♪', group_id)
     except Exception as e:
@@ -311,10 +351,27 @@ async def handle_message(ws, msg):
 async def main():
     import websockets
     import asyncio
+    if not ALLOWED_USERS:
+        log(f'[警告] 白名单为空 —— fail-closed: 所有消息都会被拦截。'
+            f'请在 {QQ_CONFIG_PATH} 的 allowed_users 里填 QQ 号数组后重启')
+    if not FFMPEG:
+        log('[警告] 找不到 ffmpeg (系统 PATH 和 本目录\\bin 都没有) —— 语音不可用, 只发文字')
+
+    def ws_connect():
+        """带 Bearer 口令连 NapCat (P0-3); websockets <14 的参数名是 extra_headers。"""
+        kw = {'max_size': 20 * 1024 * 1024}
+        if not WS_TOKEN:
+            return websockets.connect(WS_URL, **kw)
+        hdr = {'Authorization': f'Bearer {WS_TOKEN}'}
+        try:
+            return websockets.connect(WS_URL, additional_headers=hdr, **kw)
+        except TypeError:
+            return websockets.connect(WS_URL, extra_headers=hdr, **kw)
+
     while True:
         try:
             log(f'[启动] 连接 {WS_URL} ...')
-            async with websockets.connect(WS_URL, max_size=20*1024*1024) as ws:
+            async with ws_connect() as ws:
                 log('[连接] 已建立, 等待消息...')
                 poll_task = asyncio.create_task(poll_replies(ws))
                 async def heartbeat():
@@ -325,18 +382,21 @@ async def main():
                             break
                         await asyncio.sleep(30)
                 hb_task = asyncio.create_task(heartbeat())
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
-                    if msg.get('post_type') != 'message':
-                        continue
-                    if msg.get('message_type') not in ('private', 'group'):
-                        continue
-                    asyncio.create_task(handle_message(ws, msg))
-                hb_task.cancel()
-                poll_task.cancel()
+                try:
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        if msg.get('post_type') != 'message':
+                            continue
+                        if msg.get('message_type') not in ('private', 'group'):
+                            continue
+                        asyncio.create_task(handle_message(ws, msg))
+                finally:
+                    # 收尾必须走 finally: 接收循环一抛异常, 不 cancel 就泄漏 (P2-4)
+                    hb_task.cancel()
+                    poll_task.cancel()
         except Exception as e:
             log(f'[断线] {e}, 5 秒后重连...')
             await asyncio.sleep(5)

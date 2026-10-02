@@ -16,7 +16,7 @@ Say '═════════════════════════
 Say ''
 
 $base = 'D:\AI\JARVIS'
-$scriptDir = $args[0].TrimEnd('\')
+$scriptDir = ($args[0] -replace '"', '').TrimEnd('\')
 New-Item -ItemType Directory -Path $base -Force | Out-Null
 
 # ---------- [1/4] 环境检查 ----------

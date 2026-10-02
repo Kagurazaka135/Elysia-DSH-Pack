@@ -132,6 +132,19 @@ pkg2 = 往 ~/.dsh/.agent-presets/ 塞「爱莉」人格预设，并设为默认
 +      disabled: true
 ```
 
+上面那个 workflow 改名有个坑，装到**非 0.1.6** 的机器上就会踩：
+
+- 预设按 0.1.6 写 `@deepseek-ai/dsh-workflow-ptc`，而 **0.1.5.x 只有
+  `@deepseek-ai/dsh-workflow-worker-thread`**。名字解析不到时，DSH 的预设体检会把
+  整个预设判成 **broken**，界面上就是一张红标签卡片「**加载失败**」——
+  点都点不进去，也不告诉你为什么。
+- 安装脚本现在会**按本机实际装着的包换名**（有 ptc 用 ptc，只有 worker-thread 就换回去），
+  并**逐行自检**预设引用的插件是否都在本机，缺了直接列出来。
+
+另外修了默认预设那一段：旧脚本看到 `settings.yaml` 里已经有 `agent-presets` 键就整段跳过
+（Web 设置页早就写过这个键），于是默认值永远停在 `standard` —— 现在按段定位、只改
+`default` 的值，并留一份 `settings.yaml.bak-pkg2` 备份。
+
 ### 包3 · QQ 包（改动最大）
 
 原版插件是个 `cordis_define` 代码片段，靠用户**手动往会话里贴**。0.1.6 没这个工具了，所以整个重写：
@@ -142,7 +155,9 @@ pkg2 = 往 ~/.dsh/.agent-presets/ 塞「爱莉」人格预设，并设为默认
 | 路由 `kind` | `'json'`（**非法值**，静默落进 prefix 表） | `'exact'` |
 | 请求体读取 | 无上限 | 有界读取 |
 | agent 归属 | 所有 QQ 用户**共用一条会话** | 一人一个 agent，上下文隔离 |
-| 鉴权 | 无 | 支持共享 token |
+| 鉴权 | 无 | 支持共享 token，安装时生成（`qq-config.json` 同步给分身/插件/NapCat 三方） |
+| WS 鉴权 | `onebot11.json` 的 token 留空 | 安装时生成 token，分身连接带 Bearer 头 |
+| 发送者白名单 | 无，谁发都回 | 安装时必填；非白名单直接拦截（分身 fail-closed，插件侧 `allowedUsers` 双保险） |
 | 回复通道 | 模型写 `reply.json` 文件，脚本轮询 | 订阅 `session/event` 事件流 → 内存队列 → HTTP 取 |
 | 进程重启 | 会**重发**历史回复（刷屏） | 游标落盘，只发新的 |
 
@@ -150,6 +165,8 @@ pkg2 = 往 ~/.dsh/.agent-presets/ 塞「爱莉」人格预设，并设为默认
 
 - **人格包没装时，QQ 桥会整个崩掉** —— 预设挂载失败会连带回滚 agent 创建，现在降级成默认预设继续跑。
 - **纯图片消息会收到误导提示**（"连接有点问题"）—— 现在如实回"看不见图片"。
+- **NapCat 原来只给链接让用户自己下** —— 安装脚本现在先尝试自动拉 release zip，失败再退回手动指引。
+- **消息里的图片一律不下载**（旧版会对任意 URL 直接 `urlretrieve`）—— 等做图片支持时带域名白名单加回来。
 
 ### 包4 · 视频包（本仓库新增）
 
@@ -170,6 +187,7 @@ pkg2 = 往 ~/.dsh/.agent-presets/ 塞「爱莉」人格预设，并设为默认
 - **视频**：装了包4 才有，且**只在网页面**可用（QQ 桥不支持传图片/视频）；机器上需要有 `ffmpeg` 在 PATH
   （**太老的版本解不动手机拍的 HEVC**，建议从 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 装新版）。
 - **语音**：需要额外装 CosyVoice（约 3GB）+ ffmpeg。没装时**文字照发**，只是没有语音条。
+- **API Key 是明文**存在 `~/.dsh/.credentials.yaml`（dsh 上游的设计），别把这台机器上的这个文件发给别人。
 - **只在 v0.1.6-alpha.2 上测过**，其他版本没验证。
 - 验证口径：包1/2/3 在**模拟环境**（全新 DSH_HOME + NapCat 模拟器）端到端通过；
   包4 在**真 `dsh web`** 上加载无报错、工具真出结果（含 `video_analyze` 出真实画面描述）。
@@ -190,6 +208,13 @@ src/                 # 同一份内容展开成源码，给想改/想审查的�
 
 `src/` 里每个包的 `setup.ps1` 是把 `install.bat` 里 base64 打包的 PowerShell **解码后的可读版本** ——
 `install.bat` 本身是「提权 + 解码 + 执行」的外壳，逻辑全在 `setup.ps1` 里，想看改了什么直接 diff 这个。
+
+> **改 `setup.ps1` 后必须重打包进 `install.bat`，否则装的时候跑的还是旧逻辑。**
+> 内嵌载荷的编码约定：把 `setup.ps1` 读成文本 → 去掉已有的 BOM → 换行统一成 **LF** →
+> 按 **UTF-8 带 BOM** 编码 → base64 → 每 **100** 字符一行，包在
+> `-----BEGIN/END CERTIFICATE-----` 之间，每行前缀 `>>"%B64%" echo `。
+> 那个 BOM 不是可选的：解出来的脚本一旦没有 BOM，PowerShell 5.1 就会按系统 ANSI 码页
+> 去解码这个 UTF-8 文件，中文全乱，甚至报出根本不存在的语法错误。
 
 ---
 

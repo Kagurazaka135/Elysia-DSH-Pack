@@ -10,7 +10,7 @@
  * 自己在跟 QQ 说话。
  *
  * 一个 QQ 号 = 一个 agent = 一条会话，所以不同用户的上下文天然隔离，
- * 且 agent 作用域可以单独挂权限闸门（本文件暂未挂，见 README 的"还没做"）。
+ * 且 agent 作用域可以单独挂权限闸门（本文件暂未挂，这是下一步的活）。
  */
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'

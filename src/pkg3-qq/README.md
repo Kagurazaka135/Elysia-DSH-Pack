@@ -13,6 +13,8 @@
    - 确保 DSH 在跑（双击桌面的 `start-elysia.bat`）
    - 运行分身：`python D:\AI\JARVIS\qq-elysia.py`
 5. 用你的大号 QQ 加小号好友 → 发消息 = 和爱莉聊天！
+   （只有安装时填进白名单的 QQ 号能聊；换人要改 `D:\AI\JARVIS\qq-config.json`
+   里的 `allowed_users`，然后重启分身）
 
 ## 功能
 - 💬 **私聊**：发消息爱莉就回
@@ -30,8 +32,12 @@ README.md
 ```
 
 ## 常见问题
+- **别人发消息没反应**：白名单外的一律不回（安全设计，就是安装时让你填的那个名单）。
+  把 TA 的 QQ 号加进 `D:\AI\JARVIS\qq-config.json` 的 `allowed_users`，重启分身
 - **没有语音**：先看分身后台的日志。多半是没装 CosyVoice —— 语音链路需要
   包2 里那个约 3GB 的模型（见包2 README 第 3 节）。没装时**文字照发**，不会丢消息
+- **分身日志说"找不到 ffmpeg"**：语音转码要用 ffmpeg。装一个并让它在 PATH 里
+  （`winget install Gyan.FFmpeg`），或把 `ffmpeg.exe` 放进 `D:\AI\JARVIS\bin\`，重启分身
 - **重复消息**：分身已内置去重（10秒内同消息只回一次）
 - **发图片没反应**：对的，暂不支持（只看得见文字）
 - **NapCat 登录不了**：确认小号没在其他地方登录

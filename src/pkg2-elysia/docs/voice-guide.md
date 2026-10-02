@@ -24,10 +24,12 @@
 
 ## 三、安装 CosyVoice 代码（约 10 分钟）
 ```bat
-git clone https://github.com/FunAudioLLM/CosyVoice.git
-cd CosyVoice
+git clone https://github.com/FunAudioLLM/CosyVoice.git D:\AI\JARVIS\cosyvoice
+cd /d D:\AI\JARVIS\cosyvoice
 python -m pip install -r requirements.txt
 ```
+
+> 路径别换地方：爱莉的语音分身（`qq-elysia.py`）按 `D:\AI\JARVIS\cosyvoice` 找引擎代码。
 
 ## 四、放好爱莉的声音样本
 语音克隆需要一段「参照音」。

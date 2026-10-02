@@ -12,6 +12,9 @@
 $Cyan = 'Cyan'; $Green = 'Green'; $Yellow = 'Yellow'; $Pink = 'Magenta'
 function Say($m, $c = $Cyan) { Write-Host "  $m" -ForegroundColor $c }
 
+# UTF-8 无 BOM 写入: PS5.1 的 Set-Content -Encoding UTF8 带 BOM, 统一走无 BOM (P3-4)
+$script:utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
 Say '======================================================' $Pink
 Say '   DeepSeek Harness 全自动安装' $Pink
 Say '   你只需要做两件事:' $Pink
@@ -56,6 +59,21 @@ if ($node -and $npm) {
             Say "  下载 $url ..." $Yellow
             $installer = Join-Path $env:TEMP 'nodejs-setup.msi'
             Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -TimeoutSec 180
+            # SHA256 校验 (P3-5): 镜像目录自带官方 SHASUMS256.txt; 校验不过/没得校验就换官方源重下
+            $sumOk = $false
+            try {
+                $sums = Invoke-WebRequest -Uri "https://npmmirror.com/mirrors/node/$ver/SHASUMS256.txt" -UseBasicParsing -TimeoutSec 60
+                $line = ($sums.Content -split "`n" | Where-Object { $_ -match [regex]::Escape("node-$ver-x64.msi") } | Select-Object -First 1)
+                if ($line) {
+                    $want = ($line.Trim() -split '\s+')[0]
+                    $got = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLower()
+                    $sumOk = ($got -eq $want.ToLower())
+                }
+            } catch { Say '  官方校验值没拉到' $Yellow }
+            if (-not $sumOk) {
+                Say '  镜像包校验不过/没法校验, 换官方源重下 ...' $Yellow
+                Invoke-WebRequest -Uri "https://nodejs.org/dist/$ver/node-$ver-x64.msi" -OutFile $installer -UseBasicParsing -TimeoutSec 300
+            }
             if ((Get-Item $installer).Length -gt 5MB) {
                 Say '  静默安装中...' $Yellow
                 Start-Process msiexec -ArgumentList "/i `"$installer`" /qn /norestart" -Wait
@@ -127,18 +145,20 @@ $key = (Read-Host '  请粘贴 DeepSeek API Key (https://platform.deepseek.com �
 if ($key.Length -lt 10) { Say '  Key 无效'; Read-Host '回车退出'; exit 1 }
 $dshHome = Join-Path $env:USERPROFILE '.dsh'
 New-Item -ItemType Directory -Path $dshHome -Force | Out-Null
-@"
+$credYaml = @"
 version: 1
 refs:
   DEEPSEEK_API_KEY: '$key'
-"@ | Set-Content -Path (Join-Path $dshHome '.credentials.yaml') -Encoding UTF8
+"@
+[IO.File]::WriteAllText((Join-Path $dshHome '.credentials.yaml'), $credYaml, $script:utf8NoBom)
 $settingsPath = Join-Path $dshHome 'settings.yaml'
 if (-not (Test-Path $settingsPath)) {
-    @"
+    $settingsYaml = @"
 agent-default-model:
   model: deepseek-v4-flash
   provider: deepseek-official
-"@ | Set-Content -Path $settingsPath -Encoding UTF8
+"@
+    [IO.File]::WriteAllText($settingsPath, $settingsYaml, $script:utf8NoBom)
 }
 Say '  OK Key 已配置' $Green
 
