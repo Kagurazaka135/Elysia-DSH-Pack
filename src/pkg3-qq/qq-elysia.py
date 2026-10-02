@@ -193,9 +193,6 @@ async def send_voice(ws, user_id, wav_bytes, group_id=None):
             'echo': 'voice'
         }))
 
-# 等待中的 msgId -> user_id 映射
-WAITING = {}
-
 # 取回复的游标必须落盘。新版桥的回复队列在内存里、不会自己清, 如果每次启动都
 # 从 0 开始拉, 重启分身就会把攒下的历史回复整个再发一遍 (刷屏)。
 # 存下"上次取到哪": 关掉分身期间 agent 的回复仍会补发, 已发过的不会重发。
