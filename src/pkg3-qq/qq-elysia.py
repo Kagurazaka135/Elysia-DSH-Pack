@@ -72,6 +72,74 @@ def find_ffmpeg():
 
 FFMPEG = find_ffmpeg()
 
+def _sniff_ext(head):
+    """按魔数认真实图片格式。ffmpeg 按扩展名配 demuxer, PNG 内容顶着 .jpg 名
+    会"Picture size invalid"且退出码还是 0 —— 必须先认格式再命名。"""
+    if head[:8] == b'\x89PNG\r\n\x1a\n':
+        return '.png'
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return '.webp'
+    if head[:4] == b'GIF8':
+        return '.gif'
+    return '.jpg'
+
+# ---------- 图片下载 (二阶段 P2-4: 腾讯 CDN 白名单 + 400px 压缩 + 数量/大小上限) ----------
+# SSRF 面 (P0-5): 只从 QQ 官方 CDN 下载。NapCat 推过来的图片 URL 本来就在这几个域里,
+# 域外一律不碰 —— 既挡外部 URL, 也挡"构造消息让分身去拉内网地址"。
+ALLOWED_IMG_HOSTS = ('multimedia.nt.qq.com.cn', 'gchat.qpic.cn', 'qq.com')
+MAX_IMAGES = 3
+MAX_IMG_BYTES = 5 * 1024 * 1024
+
+def download_images(image_urls):
+    """下载消息里的图片, 返回本地路径列表。每张: 白名单 -> 带上限下载 -> ffmpeg 压到 400px。"""
+    from urllib.parse import urlparse
+    import subprocess
+    import urllib.request
+    ok = []
+    for i, url in enumerate(image_urls[:MAX_IMAGES]):
+        host = urlparse(url).hostname or ''
+        if not any(host == h or host.endswith('.' + h) for h in ALLOWED_IMG_HOSTS):
+            log(f'[图片] 非白名单域名, 跳过: {host}')
+            continue
+        img_dir = os.path.join(BASE, 'tasks', 'qq-images')
+        os.makedirs(img_dir, exist_ok=True)
+        stamp = int(time.time() * 1000)
+        dst = os.path.join(img_dir, f'qq_{stamp}_{i}.jpg')
+        raw = dst
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read(MAX_IMG_BYTES + 1)   # 读满上限+1 就停, 刷大图打不爆内存/磁盘
+            if len(data) > MAX_IMG_BYTES:
+                log(f'[图片] 超过 {MAX_IMG_BYTES // (1024 * 1024)}MB 上限, 丢弃')
+                continue
+            # 先认格式再命名: ffmpeg 按扩展名配 demuxer, PNG 内容叫 .jpg 会解不动
+            # (Picture size invalid, 且退出码还是 0, 靠产物检查兜底)
+            raw = os.path.join(img_dir, f'raw_{stamp}_{i}{_sniff_ext(data[:16])}')
+            with open(raw, 'wb') as f:
+                f.write(data)
+            if FFMPEG:                                    # 压到 400px 宽 (约 15-60KB), 省 token
+                subprocess.run([FFMPEG, '-y', '-i', raw, '-vf', 'scale=400:-1',
+                                '-q:v', '8', dst], capture_output=True, timeout=30)
+            if os.path.exists(dst) and os.path.getsize(dst) > 500:
+                os.remove(raw)
+            else:
+                os.replace(raw, dst)                      # 压失败/没 ffmpeg -> 用原图
+            raw = dst
+            ok.append(dst)
+            log(f'[图片] 已下载 {dst} ({os.path.getsize(dst)}B)')
+        except Exception as e:
+            log(f'[图片下载失败] {e}')
+            for p in {raw, dst}:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+    if len(image_urls) > MAX_IMAGES:
+        log(f'[图片] 只处理前 {MAX_IMAGES} 张 (消息里带了 {len(image_urls)} 张)')
+    return ok
+
 def load_json(path):
     if os.path.exists(path):
         try:
@@ -84,16 +152,30 @@ def save_json(path, data):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def forward_to_host(text, user_id, group_id=None):
-    """转发给真身, 返回 sessionId"""
+class ForwardError(Exception):
+    """注入接口返回了错误状态码。401=口令不对, 403=白名单没同步 —— 分身靠它区分话术。"""
+    def __init__(self, status, detail=''):
+        super().__init__(f'HTTP {status}: {detail}')
+        self.status = status
+
+def forward_to_host(text, user_id, group_id=None, images=None):
+    """转发给真身, 返回 sessionId。images = 已落盘的本地图片路径 (二阶段 P2-4)。"""
     import urllib.request
+    import urllib.error
     body = json.dumps({'text': text, 'userId': user_id, 'groupId': group_id or '',
-                       'token': TOKEN}).encode()
+                       'token': TOKEN, 'images': images or []}).encode()
     req = urllib.request.Request(INJECT_URL, body,
                                  {'Content-Type': 'application/json'}, method='POST')
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read())
-    return data.get('sessionId', '')
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return data.get('sessionId', '')
+    except urllib.error.HTTPError as e:
+        try:
+            detail = str(json.loads(e.read().decode('utf-8', 'replace')).get('error') or '')
+        except Exception:
+            detail = ''
+        raise ForwardError(e.code, detail) from None
 
 # ---------- TTS ----------
 _cv = None
@@ -314,8 +396,10 @@ async def handle_message(ws, msg):
     if not text and not image_urls:
         return
 
-    # 去重: 10 秒内同一用户相同消息只处理一次 (加锁防并发穿透)
-    if dedup_is_repeat(f'{user_id}:{group_id}:{text}'):
+    # 去重: 10 秒内同一用户相同消息只处理一次 (加锁防并发穿透)。
+    # 纯图消息 text 为空, 键里补上首图 URL, 不然两张不同的图会被当成重复。
+    dedup_key = f'{user_id}:{group_id}:{text}:{image_urls[0] if image_urls else ""}'
+    if dedup_is_repeat(dedup_key):
         log(f'[去重] 忽略重复消息: {text[:30]}')
         return
 
@@ -323,47 +407,75 @@ async def handle_message(ws, msg):
     if mtype == 'group' and not is_at_me:
         return
 
-    # 暂不支持看图: 消息里的图片一律不下载。旧版会 urlretrieve 任意 URL ——
-    # 纯属 SSRF 面, 而且下回来也没人用。二阶段做图片支持时, 带上腾讯 CDN
-    # 域名白名单 (multimedia.nt.qq.com.cn / gchat.qpic.cn) 再加回来。
-    if image_urls:
-        log(f'[图片] 忽略 {len(image_urls)} 张 (暂不支持看图, 不下载)')
+    # 看图 (二阶段 P2-4): 落盘后把路径随注入交给插件, 插件转成 image block。
+    # 白名单/数量/大小上限都在 download_images 里; 全失败时 local_images 为空。
+    local_images = download_images(image_urls) if image_urls else []
+    if image_urls and not local_images:
+        log(f'[图片] {len(image_urls)} 张全部下载失败/被拦')
 
-    # 纯图片消息没有文字可转, 说明白就行。不拦的话它会带着空 text 转发
-    # -> 桥返回 400 -> 用户收到"连接有点问题", 那是误导。
-    if not text:
-        log(f'[图片] {user_id} 只发了图, 当前不支持')
-        await send_text(ws, user_id, '呜…爱莉现在还没长出眼睛，看不见图片呢。发文字给爱莉好不好？', group_id)
+    # 纯图但一张都没下下来才回话术。文字为空但有图 -> 照常转发 (文字留空), 让模型看图。
+    if not text and not local_images:
+        await send_text(ws, user_id, '呜…爱莉刚才没能把图片接住，再发一次好不好？', group_id)
         return
 
-    log(f'[收到→真身] {user_id} ({"group:"+str(group_id) if group_id else "private"}): {text}')
+    log(f'[收到→真身] {user_id} ({"group:"+str(group_id) if group_id else "private"}): '
+        f'{text or f"(纯图 x{len(local_images)})"}')
     try:
-        msg_id = forward_to_host(text, user_id, group_id)
+        msg_id = forward_to_host(text, user_id, group_id, local_images)
         log(f'[已转发] msgId={msg_id}')
         await send_text(ws, user_id, '嗯哼～爱莉收到啦，正在认真看哦，稍等一下下♪', group_id)
+    except ForwardError as e:
+        # 话术按状态码区分 (A1 验收): 401 = 口令/token 没同步, 403 = 白名单没同步,
+        # 别再一概回"连接有点问题"误导人。
+        log(f'[转发被拒] HTTP {e.status}')
+        if e.status == 401:
+            await send_text(ws, user_id,
+                            '呜…爱莉这边的口令没对上（401）。检查 qq-config.json 的 inject_token，'
+                            '然后重启爱莉分身再试。', group_id)
+        elif e.status == 403:
+            await send_text(ws, user_id,
+                            '唔…名单好像没同步（403）。确认 qq-config.json 的 allowed_users 里有你，'
+                            '然后重启爱莉分身再试。', group_id)
+        else:
+            await send_text(ws, user_id, '呜…爱莉的连接有点问题，再试一次好不好？', group_id)
     except Exception as e:
         log(f'[转发失败] {e}')
         await send_text(ws, user_id, '呜…爱莉的连接有点问题，再试一次好不好？', group_id)
 
-async def main():
+WS_HDR_KEY = None   # 延迟判定 + 自愈: 第一次连 NapCat 时按特征选定, 连不上还能翻面重试
+
+def ws_connect():
+    """带 Bearer 口令连 NapCat (P0-3)。
+
+    参数名按特征分支, 不按异常 (A4): websockets 的 connect 是惰性构造, 未知
+    关键字参数在构造时不抛, 到 await/__aenter__ 才抛 TypeError —— 旧版的
+    try/except TypeError 永远抓不到, 带着错参数直通就无限 [断线] 重连。
+
+    ⚠️ 判据不能用 hasattr(websockets, 'asyncio'): v14+ 的包属性走 lazy_import,
+    未触发解析前 hasattr 是 False (v15.0.1 实测), 会误选旧参数名 —— 而本机
+    v15 上 extra_headers 在 await 时才抛 TypeError, 正是 A4 要修的死循环。
+    稳定特征是 connect 的实现模块: v14+ 是 websockets.asyncio.* (参数名
+    additional_headers), v13 及以下是 legacy (extra_headers)。
+    """
     import websockets
+    global WS_HDR_KEY
+    kw = {'max_size': 20 * 1024 * 1024}
+    if not WS_TOKEN:
+        return websockets.connect(WS_URL, **kw)
+    hdr = {'Authorization': f'Bearer {WS_TOKEN}'}
+    if WS_HDR_KEY is None:
+        mod = getattr(websockets.connect, '__module__', '') or ''
+        WS_HDR_KEY = 'additional_headers' if mod.startswith('websockets.asyncio') else 'extra_headers'
+        log(f'[WS] 头参数名按特征定为 {WS_HDR_KEY} (connect 来自 {mod})')
+    return websockets.connect(WS_URL, **{WS_HDR_KEY: hdr}, **kw)
+
+async def main():
     import asyncio
     if not ALLOWED_USERS:
         log(f'[警告] 白名单为空 —— fail-closed: 所有消息都会被拦截。'
             f'请在 {QQ_CONFIG_PATH} 的 allowed_users 里填 QQ 号数组后重启')
     if not FFMPEG:
         log('[警告] 找不到 ffmpeg (系统 PATH 和 本目录\\bin 都没有) —— 语音不可用, 只发文字')
-
-    def ws_connect():
-        """带 Bearer 口令连 NapCat (P0-3); websockets <14 的参数名是 extra_headers。"""
-        kw = {'max_size': 20 * 1024 * 1024}
-        if not WS_TOKEN:
-            return websockets.connect(WS_URL, **kw)
-        hdr = {'Authorization': f'Bearer {WS_TOKEN}'}
-        try:
-            return websockets.connect(WS_URL, additional_headers=hdr, **kw)
-        except TypeError:
-            return websockets.connect(WS_URL, extra_headers=hdr, **kw)
 
     while True:
         try:
@@ -395,6 +507,12 @@ async def main():
                     hb_task.cancel()
                     poll_task.cancel()
         except Exception as e:
+            # 自愈兜底: 头参数名万一选错 (特征被花式打包环境骗过), 错误要等到
+            # await 才冒出来 —— 此时翻面换另一个名字, 别让机器人死循环重连。
+            if isinstance(e, TypeError) and WS_HDR_KEY and 'headers' in str(e):
+                flipped = 'extra_headers' if WS_HDR_KEY == 'additional_headers' else 'additional_headers'
+                log(f'[断线] 头参数名 {WS_HDR_KEY} 不被本机 websockets 认可, 下次重连改用 {flipped}')
+                WS_HDR_KEY = flipped
             log(f'[断线] {e}, 5 秒后重连...')
             await asyncio.sleep(5)
 

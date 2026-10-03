@@ -18,7 +18,10 @@ function Write-NoBom($path, $content) {
     [IO.File]::WriteAllText($path, $content, $script:utf8NoBom)
 }
 function New-HexToken {
-    -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })
+    # CSPRNG (D1): 旧的 Get-Random 是 System.Random, 时间种子可被离线枚举复现。
+    $b = New-Object byte[] 16
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+    ($b | ForEach-Object { $_.ToString('x2') }) -join ''
 }
 
 Say '══════════════════════════════════════' $Pink
@@ -81,13 +84,15 @@ if (-not $wsToken)     { $wsToken = New-HexToken }
 # 白名单必填: 空名单 = 分身侧 fail-closed, 爱莉谁都不理
 if ($cfgUsers.Count -eq 0) {
     Say '  [安全] 谁能跟爱莉说话? 只有名单里的 QQ 号会被放行' $Yellow
-    $raw = ''
-    while ($raw -eq '') {
+    while ($cfgUsers.Count -eq 0) {
         $raw = (Read-Host '  允许的 QQ 号 (多个用逗号隔开, 比如 123456,654321)').Trim()
         $raw = $raw -replace '，', ','
-        if ($raw -eq '') { Say '  不能留空 —— 白名单空着爱莉谁都不理' $Yellow }
+        $cfgUsers = @($raw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' })
+        # A7: 全非数字过滤后为空要重问, 别拿着空名单往下走 (装完谁都不理, 还以为坏了)
+        if ($cfgUsers.Count -eq 0) { Say '  没认出有效的 QQ 号 (只收数字), 再来一次' $Yellow }
+        $dropped = @($raw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^\d+$' })
+        if ($dropped.Count -gt 0) { Say "  已忽略非数字输入: $($dropped -join ', ')" $Yellow }
     }
-    $cfgUsers = @($raw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' })
 }
 if (-not $botQq) {
     $in = (Read-Host '  爱莉小号的 QQ 号 (回车 = 2778339130)').Trim()
@@ -111,6 +116,28 @@ if ($npmOk) {
     Say '     手动重试: cd D:\AI\JARVIS\dsh-qq-bridge && npm install' $Yellow
 }
 
+# ---------- [3.5/5] Python 依赖: websockets (A4) ----------
+# 分身用 websockets 连 NapCat。v13 及以下的参数名是 extra_headers, v14+ 才是
+# additional_headers —— 钉 >=14 让分身走新分支; 装不上只警告 (分身代码里有
+# 特征分支兜底, v13 也能连)。
+Say '[3.5/5] 检查 Python websockets ...'
+$wsVer = cmd /c "python -c ""import websockets;print(getattr(websockets,'__version__','0'))"" 2>nul"
+$needWs = $true
+if ($LASTEXITCODE -eq 0 -and $wsVer) {
+    $maj = ($wsVer.ToString().Trim() -split '\.')[0] -as [int]
+    if ($maj -ge 14) { $needWs = $false; Say "  OK websockets $wsVer" $Green }
+}
+if ($needWs) {
+    Say '  安装 websockets (>=14, 分身连 NapCat 要用) ...' $Yellow
+    cmd /c "python -m pip install --upgrade websockets --disable-pip-version-check --quiet >nul 2>&1"
+    if ($LASTEXITCODE -eq 0) {
+        Say '  OK websockets 已就位' $Green
+    } else {
+        Say '  !! websockets 没装上 (没检测到 python 或 pip 失败)' $Yellow
+        Say '     手动执行: python -m pip install "websockets>=14"' $Yellow
+    }
+}
+
 # ---------- [4/5] 装进 DSH ----------
 Say '[4/5] 把插件装进 DSH (profile: web) ...'
 $pluginDirSlash = $pluginDir.Replace('\', '/')
@@ -121,13 +148,14 @@ if ($LASTEXITCODE -ne 0) {
     Say '  OK 插件已进 web profile' $Green
 }
 
-# 往 profile 写插件配置: token + 白名单 + 预设, 值全部来自上面的安全配置段
+# 往 profile 写插件配置: 只是 qq-config.json 缺失时的兜底 (插件以 qq-config.json
+# 为唯一真源, A1)。token + 白名单 + 预设, 值全部来自上面的安全配置段
 $patchPath = Join-Path $dshHome 'profiles\web\cordis.patch.yml'
-$block = "- id: dsh-qq-bridge`n  config:`n    agentPreset: 'elysia'`n    cwd: 'D:/AI/JARVIS'`n    token: '$injectToken'`n    allowedUsers: '$allowedJoined'`n"
+$block = "- id: dsh-qq-bridge`n  config:`n    agentPreset: 'elysia'`n    cwd: 'D:/AI/JARVIS'`n    configPath: 'D:/AI/JARVIS/qq-config.json'`n    token: '$injectToken'`n    allowedUsers: '$allowedJoined'`n"
 if (Test-Path $patchPath) {
     $content = Get-Content $patchPath -Raw -Encoding UTF8
     if ($content -match 'allowedUsers:') {
-        Say '  OK 插件配置已含白名单, 跳过 (要改就编辑 profile 的 cordis.patch.yml)' $Green
+        Say '  OK 插件兜底配置已存在, 跳过 (插件实际读 D:\AI\JARVIS\qq-config.json, 改那个就行)' $Green
     } elseif ($content -match 'dsh-qq-bridge') {
         # 已有本插件的块但没配白名单 -> 整块重写成带安全字段的新块
         $newContent = [regex]::Replace($content, '(?ms)^[ \t]*-[ \t]*id:[ \t]*dsh-qq-bridge\b.*?(?=^[ \t]*-[ \t]*id:|\z)', $block)
@@ -144,25 +172,42 @@ if (Test-Path $patchPath) {
 }
 
 # ---------- [5/5] NapCat ----------
-Say '[5/5] NapCat (QQ 协议) ...'
+# 供应链 (D6): 钉死 release tag + sha256 (GitHub release 资产的官方 digest),
+# 不再用 latest。"下载失败"和"校验不符"分开报; 校验不过绝不落盘解压。
+# 升级 NapCat 时: 两个常量一起换 (digest 用
+#   curl -s https://api.github.com/repos/NapNeko/NapCatQQ/releases/tags/<tag> 看 assets[].digest)。
+$napcatTag = 'v4.18.28'
+$napcatSha256 = 'fb64fa3b036ad2df1a5d7c204c482694c20e4b763978c8a4968fd3474c05b4a8'
+Say "[5/5] NapCat (QQ 协议, 钉 $napcatTag) ..."
 $napcatDir = Join-Path $base 'napcat'
 if (Test-Path (Join-Path $napcatDir 'napcat.bat')) {
     Say '  OK 已存在' $Green
 } else {
-    Say '  尝试自动下载 NapCat (约 110MB, 慢的话耐心等) ...' $Yellow
+    Say "  自动下载 NapCat $napcatTag (约 110MB, 慢的话耐心等) ..." $Yellow
     $zipPath = Join-Path $env:TEMP 'NapCat.Shell.Windows.Node.zip'
     $dlOk = $false
     try {
         $ProgressPreference = 'SilentlyContinue'   # 不关这个, PS5.1 的下载进度条慢得离谱
-        Invoke-WebRequest -Uri 'https://github.com/NapNeko/NapCatQQ/releases/latest/download/NapCat.Shell.Windows.Node.zip' -OutFile $zipPath -UseBasicParsing -TimeoutSec 600
+        Invoke-WebRequest -Uri "https://github.com/NapNeko/NapCatQQ/releases/download/$napcatTag/NapCat.Shell.Windows.Node.zip" -OutFile $zipPath -UseBasicParsing -TimeoutSec 600
         $ProgressPreference = 'Continue'
-        if ((Get-Item $zipPath).Length -gt 50MB) { $dlOk = $true }
-        else { Say '  下载的文件不对劲 (太小), 当作失败' $Yellow }
+        $dlOk = $true
     } catch {
         $ProgressPreference = 'Continue'
         Say "  自动下载失败: $($_.Exception.Message)" $Yellow
     }
+    $hashOk = $false
     if ($dlOk) {
+        $got = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+        if ($got -eq $napcatSha256) {
+            $hashOk = $true
+            Say '  OK sha256 校验通过' $Green
+        } else {
+            # 坏包绝不解压: 删掉, 落到下面的手动指引
+            Say "  !! sha256 校验不符 (期望 $napcatSha256, 实际 $got), 已丢弃下载的文件" $Yellow
+            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($hashOk) {
         try {
             Say '  解压中 ...'
             Expand-Archive -Path $zipPath -DestinationPath $napcatDir -Force
@@ -172,8 +217,9 @@ if (Test-Path (Join-Path $napcatDir 'napcat.bat')) {
         }
     }
     if (-not (Test-Path (Join-Path $napcatDir 'napcat.bat'))) {
-        Say '  请手动下载 NapCat (约 110MB):' $Yellow
-        Say '  https://github.com/NapNeko/NapCatQQ/releases' $Yellow
+        Say '  请手动下载 NapCat (约 110MB), 选 release 页里 NapCat.Shell.Windows.Node.zip:' $Yellow
+        Say "  https://github.com/NapNeko/NapCatQQ/releases/tag/$napcatTag" $Yellow
+        Say '  (建议核对该资产页面的 sha256 再用; 装其他版本请自行确认兼容)' $Yellow
         Say '  下载 NapCat.Shell.Windows.Node.zip 解压到:' $Yellow
         Say "  $napcatDir" $Yellow
         Read-Host '下载解压完成后按回车继续'
@@ -190,7 +236,9 @@ if (Test-Path $onebotPath) {
         $existingToken = [string]$srv.token
     } catch {
         $ob = $null
-        Say '  onebot11.json 读不出来, 之后会重建一份' $Yellow
+        # A3: 重建前先备份原文件, 别把用户可能手工配过的东西直接冲掉
+        Copy-Item $onebotPath "$onebotPath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')" -Force
+        Say '  onebot11.json 读不出来, 已备份原文件并会重建一份' $Yellow
     }
 }
 if ($existingToken -ne '') {
@@ -206,31 +254,31 @@ if ($existingToken -ne '') {
     Write-NoBom $onebotPath ($ob | ConvertTo-Json -Depth 10)
     Say '  OK 已给现有 onebot11.json 补上 token' $Green
 } else {
-    $onebotJson = @"
-{
-  "network": {
-    "websocketServers": [
-      {
-        "enable": true,
-        "name": "elysia-ws",
-        "host": "127.0.0.1",
-        "port": 3001,
-        "messagePostFormat": "array",
-        "reportSelfMessage": false,
-        "token": "$wsToken"
-      }
-    ]
-  }
-}
-"@
-    Write-NoBom $onebotPath $onebotJson
+    # D10: 走 ConvertTo-Json, 不再手拼字符串模板 (转义/缩进都容易出错)
+    $onebotObj = [ordered]@{
+        network = [ordered]@{
+            websocketServers = @(
+                [ordered]@{
+                    enable = $true
+                    name = 'elysia-ws'
+                    host = '127.0.0.1'
+                    port = 3001
+                    messagePostFormat = 'array'
+                    reportSelfMessage = $false
+                    token = $wsToken
+                }
+            )
+        }
+    }
+    Write-NoBom $onebotPath ($onebotObj | ConvertTo-Json -Depth 10)
     Say '  OK OneBot 配置已写入 (端口 3001, 已带 token)' $Green
 }
 
 $launcher = Join-Path $napcatDir 'napcat\launcher.bat'
 if (Test-Path $launcher) {
-    Start-Process cmd -ArgumentList "/c","cd /d $napcatDir\napcat && launcher.bat" -Verb RunAs
-    Say '  已启动 (如有 UAC 弹窗请点是), 请用 QQ 小号扫码登录' $Yellow
+    # D9: 普通权限启动。QQ 协议端不需要管理员; 管理员跑 QQ 类程序纯属扩大攻击面。
+    Start-Process cmd -ArgumentList "/c","cd /d $napcatDir\napcat && launcher.bat"
+    Say '  已启动, 请用 QQ 小号扫码登录' $Yellow
 } else {
     Say '  未找到 launcher.bat, 请检查 NapCat 解压路径' $Yellow
 }

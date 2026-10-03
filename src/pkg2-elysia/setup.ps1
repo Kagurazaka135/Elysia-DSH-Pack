@@ -47,21 +47,37 @@ if (Test-Path (Join-Path $presetSrc 'agent.cordis.yml')) {
 #   预设里的 workflow 行是按 0.1.6 写的 (@deepseek-ai/dsh-workflow-ptc), 而 0.1.5.x
 #   上只有 @deepseek-ai/dsh-workflow-worker-thread。名字对不上时 DSH 会把整个预设
 #   标成「加载失败」(红色标签, 选都选不了), 所以这里按实际装了的包换名。
-$harnessNm = $null
-if ($dsh.Source) {
-    $npmBin = Split-Path $dsh.Source -Parent      # 一般是 %APPDATA%\npm
-    foreach ($cand in @(
-        (Join-Path $npmBin 'node_modules'),
-        (Join-Path (Split-Path $npmBin -Parent) 'node_modules')
-    )) {
-        $dshPkg = Join-Path $cand '@deepseek-ai\dsh\node_modules'
-        if (Test-Path $dshPkg) { $harnessNm = $dshPkg; break }
-    }
+#
+#   A9 实测 (0.1.6-alpha.2 + npm v11 全局安装): 依赖不提升到顶层, 全在嵌套层
+#   <npm root -g>\@deepseek-ai\dsh\node_modules\@deepseek-ai\ (259 个包),
+#   顶层只有 dsh 本体。但 npm 版本/安装方式 (pnpm、nvm shim) 不同布局会变 ——
+#   探测按候选列表兜底: 嵌套层 -> 全局顶层 -> 按 dsh 命令位置推 -> pnpm 全局;
+#   自检时包在任何候选命中都算「有」, 不再因为一层没探到就整体静默跳过。
+$roots = New-Object System.Collections.Generic.List[string]
+function Add-Root([string]$r) {
+    if ($r) { $t = $r.Trim(); if ($t -and (Test-Path $t)) { $script:roots.Add($t) } }
 }
-if ($harnessNm -and (Test-Path $composePath)) {
+$npmRootG = (cmd /c "npm root -g 2>nul" | Select-Object -Last 1)
+if ($npmRootG) {
+    Add-Root (Join-Path $npmRootG.Trim() '@deepseek-ai\dsh\node_modules')   # 嵌套布局 (实测主路径)
+    Add-Root $npmRootG.Trim()                                               # 顶层提升布局
+}
+if ($dsh.Source) {
+    $npmBin = Split-Path $dsh.Source -Parent      # 兜底: 按 dsh 命令 shim 的位置推 (nvm 等)
+    Add-Root (Join-Path $npmBin 'node_modules\@deepseek-ai\dsh\node_modules')
+    Add-Root (Join-Path $npmBin 'node_modules')
+}
+Add-Root ((cmd /c "pnpm root -g 2>nul" | Select-Object -Last 1))
+Add-Root ((cmd /c "pnpm root -g 2>nul" | Select-Object -Last 1) + '\@deepseek-ai\dsh\node_modules')
+$roots = @($roots | Select-Object -Unique)
+
+if ($roots.Count -gt 0 -and (Test-Path $composePath)) {
     $yml = [IO.File]::ReadAllText($composePath)
-    $hasPtc = Test-Path (Join-Path $harnessNm '@deepseek-ai\dsh-workflow-ptc')
-    $hasWorker = Test-Path (Join-Path $harnessNm '@deepseek-ai\dsh-workflow-worker-thread')
+    $hasPtc = $false; $hasWorker = $false
+    foreach ($r in $roots) {
+        if (Test-Path (Join-Path $r '@deepseek-ai\dsh-workflow-ptc')) { $hasPtc = $true }
+        if (Test-Path (Join-Path $r '@deepseek-ai\dsh-workflow-worker-thread')) { $hasWorker = $true }
+    }
     if (-not $hasPtc -and $hasWorker -and $yml.Contains('dsh-workflow-ptc')) {
         $yml = $yml.Replace('- id: workflow-ptc', '- id: workflow-worker-thread').Replace('@deepseek-ai/dsh-workflow-ptc', '@deepseek-ai/dsh-workflow-worker-thread')
         [IO.File]::WriteAllText($composePath, $yml, $script:utf8NoBom)
@@ -75,7 +91,11 @@ if ($harnessNm -and (Test-Path $composePath)) {
     foreach ($m in [regex]::Matches($yml, "name:\s*'(@[^']+)'")) {
         $spec = $m.Groups[1].Value
         $pkg = ($spec.Split('/')[0..1] -join '/')
-        if (-not (Test-Path (Join-Path $harnessNm ($pkg -replace '/', '\')))) { $missing += $spec }
+        $found = $false
+        foreach ($r in $roots) {
+            if (Test-Path (Join-Path $r ($pkg -replace '/', '\'))) { $found = $true; break }
+        }
+        if (-not $found) { $missing += $spec }
     }
     $missing = @($missing | Sort-Object -Unique)
     if ($missing.Count -gt 0) {

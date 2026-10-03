@@ -55,26 +55,42 @@ if ($node -and $npm) {
             $idx = Invoke-RestMethod 'https://npmmirror.com/mirrors/node/index.json' -TimeoutSec 30
             $ver = ($idx | Where-Object { $_.version -like 'v24*' } | Select-Object -First 1).version
             if (-not $ver) { $ver = ($idx | Select-Object -First 1).version }
-            $url = "https://npmmirror.com/mirrors/node/$ver/node-$ver-x64.msi"
-            Say "  下载 $url ..." $Yellow
+            $msiName = "node-$ver-x64.msi"
             $installer = Join-Path $env:TEMP 'nodejs-setup.msi'
-            Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -TimeoutSec 180
-            # SHA256 校验 (P3-5): 镜像目录自带官方 SHASUMS256.txt; 校验不过/没得校验就换官方源重下
-            $sumOk = $false
-            try {
-                $sums = Invoke-WebRequest -Uri "https://npmmirror.com/mirrors/node/$ver/SHASUMS256.txt" -UseBasicParsing -TimeoutSec 60
-                $line = ($sums.Content -split "`n" | Where-Object { $_ -match [regex]::Escape("node-$ver-x64.msi") } | Select-Object -First 1)
-                if ($line) {
-                    $want = ($line.Trim() -split '\s+')[0]
-                    $got = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLower()
-                    $sumOk = ($got -eq $want.ToLower())
+            # 下载: npmmirror 优先, 失败换官方 nodejs.org
+            $dlOk = $false
+            foreach ($src in @("https://npmmirror.com/mirrors/node/$ver/$msiName",
+                               "https://nodejs.org/dist/$ver/$msiName")) {
+                try {
+                    Say "  下载 $src ..." $Yellow
+                    Invoke-WebRequest -Uri $src -OutFile $installer -UseBasicParsing -TimeoutSec 300
+                    $dlOk = $true
+                    break
+                } catch {
+                    Say "  这个源失败了: $($_.Exception.Message)" $Yellow
                 }
-            } catch { Say '  官方校验值没拉到' $Yellow }
-            if (-not $sumOk) {
-                Say '  镜像包校验不过/没法校验, 换官方源重下 ...' $Yellow
-                Invoke-WebRequest -Uri "https://nodejs.org/dist/$ver/node-$ver-x64.msi" -OutFile $installer -UseBasicParsing -TimeoutSec 300
             }
-            if ((Get-Item $installer).Length -gt 5MB) {
+            # SHA256 校验 (P3-5/D6): 不管从哪个源下的, 一律对着 nodejs.org 官方
+            # SHASUMS256.txt 验 —— 镜像目录自带的 SHASUMS 是同源自证, 挡不住镜像被投毒。
+            # 校验不过/没得校验 = 不装这个包, 转手动指引 (宁可装不上, 不静默装坏包)。
+            $sumOk = $false
+            if ($dlOk) {
+                try {
+                    $sums = Invoke-WebRequest -Uri "https://nodejs.org/dist/$ver/SHASUMS256.txt" -UseBasicParsing -TimeoutSec 60
+                    $line = ($sums.Content -split "`n" | Where-Object { $_ -match [regex]::Escape($msiName) } | Select-Object -First 1)
+                    if ($line) {
+                        $want = ($line.Trim() -split '\s+')[0]
+                        $got = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLower()
+                        $sumOk = ($got -eq $want.ToLower())
+                    }
+                } catch { Say '  官方 SHASUMS256 没拉到' $Yellow }
+            }
+            if ($dlOk -and -not $sumOk) {
+                Say '  !! 官方校验不过/没法校验, 不装这个包 (供应链防护), 转手动安装' $Yellow
+                Remove-Item $installer -Force -ErrorAction SilentlyContinue
+                $dlOk = $false
+            }
+            if ($dlOk) {
                 Say '  静默安装中...' $Yellow
                 Start-Process msiexec -ArgumentList "/i `"$installer`" /qn /norestart" -Wait
                 Refresh-Path
@@ -153,9 +169,12 @@ refs:
 [IO.File]::WriteAllText((Join-Path $dshHome '.credentials.yaml'), $credYaml, $script:utf8NoBom)
 $settingsPath = Join-Path $dshHome 'settings.yaml'
 if (-not (Test-Path $settingsPath)) {
+    # 看图硬门 (二阶段 P2-4): dsh 的 deepseek-official 目录里只有 deepseek-flash
+    # 声明了 inputModalities 含 image; 目录外的模型 id 一律按纯文本路由 (QQ 看图
+    # 会被投影成占位文本/拒发)。默认就给 image 模型, 换模型请挑支持视觉的。
     $settingsYaml = @"
 agent-default-model:
-  model: deepseek-v4-flash
+  model: deepseek-flash
   provider: deepseek-official
 "@
     [IO.File]::WriteAllText($settingsPath, $settingsYaml, $script:utf8NoBom)

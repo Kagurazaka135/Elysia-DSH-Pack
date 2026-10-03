@@ -39,7 +39,7 @@
 |---|---|---|
 | **`elysia-pkg1-core.zip`** | 装 Node.js → `npm install -g @deepseek-ai/dsh@0.1.6-alpha.2` → 收 API Key → 后台起 `dsh web` → 生成桌面启动器 | ✅ 必须 |
 | **`elysia-pkg2-elysia.zip`** | 装爱莉人格预设，设为默认 | 推荐 |
-| **`elysia-pkg3-qq.zip`** | 接 QQ（需自备 [NapCat](https://github.com/NapNeko/NapCatQQ)） | 可选 |
+| **`elysia-pkg3-qq.zip`** | 接 QQ（NapCat 自动下载，钉版本 + sha256 校验） | 可选 |
 | **`elysia-pkg4-video.zip`** | 视频理解：内容总结 / 抽帧 / 场景检测 / GIF / 元数据（需自备 [ffmpeg](https://www.gyan.dev/ffmpeg/builds/)，脚本会检查并给指引） | 可选 |
 
 ### 安装
@@ -155,18 +155,27 @@ pkg2 = 往 ~/.dsh/.agent-presets/ 塞「爱莉」人格预设，并设为默认
 | 路由 `kind` | `'json'`（**非法值**，静默落进 prefix 表） | `'exact'` |
 | 请求体读取 | 无上限 | 有界读取 |
 | agent 归属 | 所有 QQ 用户**共用一条会话** | 一人一个 agent，上下文隔离 |
-| 鉴权 | 无 | 支持共享 token，安装时生成（`qq-config.json` 同步给分身/插件/NapCat 三方） |
+| 鉴权 | 无 | 支持共享 token，安装时生成；白名单/口令**单源** `D:\AI\JARVIS\qq-config.json`（插件每次注入都重读，改完重启分身即生效，dsh 不用动） |
 | WS 鉴权 | `onebot11.json` 的 token 留空 | 安装时生成 token，分身连接带 Bearer 头 |
-| 发送者白名单 | 无，谁发都回 | 安装时必填；非白名单直接拦截（分身 fail-closed，插件侧 `allowedUsers` 双保险） |
+| 发送者白名单 | 无，谁发都回 | 安装时必填；非白名单直接拦截（分身 fail-closed，插件同源同语义双保险） |
 | 回复通道 | 模型写 `reply.json` 文件，脚本轮询 | 订阅 `session/event` 事件流 → 内存队列 → HTTP 取 |
 | 进程重启 | 会**重发**历史回复（刷屏） | 游标落盘，只发新的 |
+| 看图 | 不支持（"没长眼睛"） | QQ 图片落盘 → `attachments` 服务转 image block 真实进模型（白名单+数量/大小上限+400px 压缩；见下面「看图」小节） |
 
 顺带修了两个会让整条链路挂掉的问题：
 
-- **人格包没装时，QQ 桥会整个崩掉** —— 预设挂载失败会连带回滚 agent 创建，现在降级成默认预设继续跑。
-- **纯图片消息会收到误导提示**（"连接有点问题"）—— 现在如实回"看不见图片"。
-- **NapCat 原来只给链接让用户自己下** —— 安装脚本现在先尝试自动拉 release zip，失败再退回手动指引。
-- **消息里的图片一律不下载**（旧版会对任意 URL 直接 `urlretrieve`）—— 等做图片支持时带域名白名单加回来。
+- **人格包没装时，QQ 桥会整个崩掉** —— 预设挂载失败会连带回滚 agent 创建，现在降级成默认预设继续跑。人格包是可选的。
+- **NapCat 原来只给链接让用户自己下** —— 安装脚本现在自动拉 **钉死版本** 的 release zip 并做 sha256 校验，失败/校验不过转手动指引。
+
+### 包3 · 看图（feat/看图与填坑 这轮接回来的）
+
+- **链路**：`qq-elysia.py` 收到图片段 → 只从 **QQ 官方 CDN 白名单**（`multimedia.nt.qq.com.cn` / `gchat.qpic.cn` / `qq.com`）下载（≤3 张、单张 ≤5MB、ffmpeg 压到 400px）→ 路径随注入 body 的 `images` 字段交给插件 → 插件读文件、按**魔数**认格式（PNG 内容顶着 .jpg 名也能认对）、经 dsh `attachments` 服务落盘成 image block → 和文本一起 `followup` 进 agent。纯图消息（只有图没字）照常转发。
+- **⚠️ 前提是模型支持视觉（硬门）**：dsh 的 deepseek-official 目录里只有 `deepseek-flash` 声明了 `inputModalities: [text, image]`；**目录外的模型 id 一律按纯文本路由**——给纯文本模型发图，图会被投影成占位文本或在请求时被 dsh 直接拒掉，怎么调都"看不见图"。所以包1 的默认模型已从 `deepseek-v4-flash`（目录外=纯文本）换成 **`deepseek-flash`**。插件还会在注入带图消息前用 `ctx.llm.listModels()` 查一次目录：能确定当前默认模型不支持图片时，就不发图块、改成在消息里如实备注"当前模型不支持看图"（判定按 provider/model 缓存）。**不硬编码视觉模型 id**——上游模型目录变了会自动跟随/如实降级，而不是静默失效。
+- **改白名单不再两处跑**（A1）：以前插件读 profile 里的副本、分身读 `qq-config.json`，改了后者插件永远不跟（新号 403、换 token 401）。现在插件以 `qq-config.json` 为唯一真源（按 mtime 缓存直读），且 401（口令不对）和 403（白名单外）状态码分开，分身按码回不同话术。
+- ** NapCat 钉版本 + hash**（D6）：不再拉 `latest`，钉 `v4.18.28` + 该资产的 sha256（下载失败与校验不符分开报，坏包绝不解压）；包1 的 Node.js 安装包也改为**一律对 nodejs.org 官方 SHASUMS256 校验**（镜像自带的 SHASUMS 是同源自证，挡不住镜像被投毒）。
+- **websockets 兼容**（A4）：分身连 NapCat 的头参数名按 `websockets.connect.__module__` 特征选（v14+ `additional_headers` / v13- `extra_headers`），认错时重连自动翻面；安装脚本会 `pip install websockets>=14`。⚠️ 交接单原建议的 `hasattr(websockets,'asyncio')` 判据在 v15 上实测不成立（包属性 lazy_import，未触发解析前是 False）。
+- **token 生成改 CSPRNG**（D1）：`Get-Random` 是时间种子可被离线枚举复现，改 `RandomNumberGenerator::GetBytes`。
+- NapCat 启动从管理员降为普通权限（D9）；`onebot11.json` 重建前先备份（A3）、改走 `ConvertTo-Json`（D10）；白名单输入全非数字时重问（A7）。
 
 ### 包4 · 视频包（本仓库新增）
 
@@ -183,8 +192,12 @@ pkg2 = 往 ~/.dsh/.agent-presets/ 塞「爱莉」人格预设，并设为默认
 
 ## 已知限制
 
-- **图片**：不支持。发图片会被忽略，爱莉只看得见文字。
-- **视频**：装了包4 才有，且**只在网页面**可用（QQ 桥不支持传图片/视频）；机器上需要有 `ffmpeg` 在 PATH
+- **图片（QQ 面）**：链路已通，但**默认模型必须支持视觉**才真看得见——包1 新装默认
+  `deepseek-flash`（dsh 目录里声明的文本+图像模型）。已装过的老环境若默认还是
+  `deepseek-v4-flash`（不在 dsh 目录里 = 纯文本路由），QQ 发图只会得到"看不了图"
+  的如实回复，去 dsh Web 设置页把默认模型换成支持视觉的即可。插件会查模型目录并
+  在不支持时降级为纯文本+备注，不会白跑。
+- **视频**：装了包4 才有，且**只在网页面**可用（QQ 桥不支持传视频）；机器上需要有 `ffmpeg` 在 PATH
   （**太老的版本解不动手机拍的 HEVC**，建议从 [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 装新版）。
 - **语音**：需要额外装 CosyVoice（约 3GB）+ ffmpeg。没装时**文字照发**，只是没有语音条。
 - **API Key 是明文**存在 `~/.dsh/.credentials.yaml`（dsh 上游的设计），别把这台机器上的这个文件发给别人。
@@ -192,6 +205,10 @@ pkg2 = 往 ~/.dsh/.agent-presets/ 塞「爱莉」人格预设，并设为默认
 - 验证口径：包1/2/3 在**模拟环境**（全新 DSH_HOME + NapCat 模拟器）端到端通过；
   包4 在**真 `dsh web`** 上加载无报错、工具真出结果（含 `video_analyze` 出真实画面描述）。
   **全部未在真 QQ 上实跑过**（需真人扫码登录，无法自动模拟）。
+- 看图链路（feat/看图与填坑）：Python 侧（白名单/压缩/上限/转发）与插件侧（图块转换/
+  能力预检/单源鉴权）各有一套 mock 实测（本地 mock CDN + mock dsh ctx，30+27 项断言全过）；
+  模型能力结论对**实测安装的 dsh 0.1.6-alpha.2** 核过（`deepseek-flash` = text+image，
+  目录外 id = 纯文本路由）。**真 QQ + 真 NapCat 的端到端仍未实跑**（需扫码登录）。
 
 ---
 
@@ -210,6 +227,8 @@ src/                 # 同一份内容展开成源码，给想改/想审查的�
 `install.bat` 本身是「提权 + 解码 + 执行」的外壳，逻辑全在 `setup.ps1` 里，想看改了什么直接 diff 这个。
 
 > **改 `setup.ps1` 后必须重打包进 `install.bat`，否则装的时候跑的还是旧逻辑。**
+> 直接跑 `python tools/repack.py`（`--check` 只校验不写入）：自动把四个包的 `src/`
+> 重打进 `packages/*.zip`，做 round-trip 断言，并把 zip 里的 `install.bat` 统一成 **CRLF**。
 > 内嵌载荷的编码约定：把 `setup.ps1` 读成文本 → 去掉已有的 BOM → 换行统一成 **LF** →
 > 按 **UTF-8 带 BOM** 编码 → base64 → 每 **100** 字符一行，包在
 > `-----BEGIN/END CERTIFICATE-----` 之间，每行前缀 `>>"%B64%" echo `。
