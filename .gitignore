@@ -11,3 +11,13 @@ reply-cursor.json
 
 # 开发过程中的交接单/工作底稿（含本地路径），不进公开仓库
 HANDOFF-*.md
+
+# Python 运行产物
+__pycache__/
+*.pyc
+
+# 测试 npm install 的副产物: 约定不进库也不进包 (与现包行为一致)
+src/**/package-lock.json
+
+# 重打包前备份 (tools/repack.py 生成, 本地留存)
+packages/*.zip.before-*
