@@ -12,6 +12,10 @@ reply-cursor.json
 # 开发过程中的交接单/工作底稿（含本地路径），不进公开仓库
 HANDOFF-*.md
 
+# 改进计划总纲（1.0=Python 补丁 / 2.0=插件化最终目标）——内部文档不公开，
+# zcode 在本机直接读文件；archive 原件在 G:\code\_archive\elysia-pack-旧材料-2026-10-01\
+改进计划*.md
+
 # Python 运行产物
 __pycache__/
 *.pyc
