@@ -5,12 +5,10 @@
  *   POST /api/qq/inject   外部机器人把 QQ 消息送进来 → 注入该用户的 agent
  *   GET  /api/qq/replies  外部机器人把 agent 的回复取走
  *
- * 回复是**订阅 session 事件流**拿到的（照 ACP 的做法：`session/event` 里过滤
- * `assistant/message`），不靠模型写文件、也不靠模型调工具 —— 模型不需要知道
- * 自己在跟 QQ 说话。
+ * 回复主要由模型调用 qq_reply 提交；session/event 抓取回合最后一段文本作兜底。
  *
  * 一个 QQ 号 = 一个 agent = 一条会话，所以不同用户的上下文天然隔离，
- * 且 agent 作用域可以单独挂权限闸门（本文件暂未挂，这是下一步的活）。
+ * 且 agent 作用域按 blockedTools 配置挂权限闸门。
  */
 import { randomUUID } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
@@ -22,6 +20,7 @@ import z from '@deepseek-ai/schemastery'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 
 /** cordis 插件名，loader 诊断用。 */
 export const name = 'dsh-qq-bridge'
@@ -30,7 +29,7 @@ export const name = 'dsh-qq-bridge'
  * 依赖的服务：路由注册、agent 注册表、预设挂载、默认模型路由、
  * 附件落盘（看图用，二阶段 P2-4）、模型目录（图片能力硬门）。
  */
-export const inject = ['webServer', 'agents', 'agentPresets', 'agentDefaultModel', 'attachments', 'llm']
+export const inject = ['webServer', 'agents', 'agentPresets', 'agentDefaultModel', 'attachments', 'llm', 'tools']
 
 export const Config = z.object({
   /** 注入/取回复要带的共享口令。实际生效值优先读 configPath 指向的 qq-config.json
@@ -38,7 +37,7 @@ export const Config = z.object({
   token: z.string().default(''),
   /** 共享配置（qq-config.json）的绝对路径：白名单/口令的唯一真源。 */
   configPath: z.string().default('D:/AI/JARVIS/qq-config.json'),
-  /** 每个 QQ 用户用哪个 agent preset。留空 = 用 settings 里的默认预设。 */
+  /** 每个 QQ 用户用哪个 agent preset。留空 = 内置 standard。 */
   agentPreset: z.string().default('elysia'),
   /** agent 的工作目录（必须是绝对路径且存在）。留空 = 用户主目录。 */
   cwd: z.string().default(''),
@@ -49,6 +48,8 @@ export const Config = z.object({
   maxBodyBytes: z.number().default(64 * 1024),
   /** 回复队列最多留多少条，防止外部程序长期不取导致内存涨。 */
   replyBuffer: z.number().default(500),
+  /** QQ 侧禁用的工具名，逗号分隔。空 = 不拦。 */
+  blockedTools: z.string().default(''),
 })
 
 /** 读取有上限的请求体；超限返回 null（并 drain 掉剩余，好让拒绝是个可读响应）。 */
@@ -146,9 +147,11 @@ export function apply(ctx, config) {
   const groupBySession = new Map()
   /** sessionId -> 当前回合最后一段非空 assistant 文本。 */
   const pendingText = new Map()
+  /** 本回合已通过 qq_reply 回复的 session，避免事件兜底重复入队。 */
+  const repliedThisTurn = new Set()
   /** 待外部取走的回复。 */
   const replies = []
-  let replySeq = 0
+  let lastReplyId = 0
 
   // ── A1 单源：白名单/口令以 qq-config.json 为唯一真源 ──────────────────────
   // 分身（Python）、NapCat（onebot11.json）、安装脚本都读写同一个文件；以前插件
@@ -243,7 +246,7 @@ export function apply(ctx, config) {
     if (existing !== undefined) return existing.handle.agent
 
     const sessionId = SessionId(`qq-${userId}-${randomUUID()}`)
-    const preset = config.agentPreset !== '' ? config.agentPreset : undefined
+    const preset = config.agentPreset !== '' ? config.agentPreset : 'standard'
 
     // 没有这一步，prompt 里的 {{model}} / {{provider}} 会注册了却没有值，
     // 人格段落一渲染就报 "has no value for this assembly"。headless 和 ACP
@@ -255,19 +258,27 @@ export function apply(ctx, config) {
       sessionId,
       meta: {
         cwd,
-        ...(preset !== undefined ? { agentPreset: preset } : {}),
+        agentPreset: preset,
       },
       agentOptions,
       setup: async (agentCtx) => {
         installModelSelection(agentCtx, { current: selection, assembled: undefined })
+        const blocked = new Set(config.blockedTools.split(',').map(s => s.trim()).filter(s => s !== ''))
+        if (blocked.size > 0) {
+          agentCtx.tools.guard((exec) => {
+            if (blocked.has(exec.name)) return `工具 ${exec.name} 已被 QQ 侧闸门禁用`
+            return undefined
+          })
+        }
         // 光给 meta.agentPreset 只会在日志里 warning，真正把预设挂上去得在这里显式调。
-        if (preset !== undefined) {
+        try {
+          await ctx.agentPresets.mount(agentCtx, preset)
+        } catch (error) {
+          log.warn(`[qq-bridge] 预设 "${preset}" 挂载失败，尝试内置 standard：${String(error)}`)
           try {
-            await ctx.agentPresets.mount(agentCtx, preset)
-          } catch (error) {
-            // 预设没装（比如人格包没装 / 名字写错）不该让整条链路陪葬 ——
-            // 降级成默认预设，至少还能聊。人格包是可选的。
-            log.warn(`[qq-bridge] 预设 "${preset}" 挂载失败，改用默认预设：${String(error)}`)
+            await ctx.agentPresets.mount(agentCtx, 'standard')
+          } catch (fallbackError) {
+            log.warn(`[qq-bridge] standard 也挂载失败，进入无工具模式：${String(fallbackError)}`)
           }
         }
       },
@@ -275,15 +286,17 @@ export function apply(ctx, config) {
 
     agentsByUser.set(userId, { handle, sessionId })
     userBySession.set(sessionId, userId)
-    log.info(`[qq-bridge] 为 ${userId} 建了新 agent（session ${sessionId}，preset ${preset ?? '(默认)'}）`)
+    log.info(`[qq-bridge] 为 ${userId} 建了新 agent（session ${sessionId}，preset ${preset}）`)
     return handle.agent
   }
 
   /** 把回复塞进待取队列。 */
   function pushReply(userId, sessionId, text) {
-    replySeq += 1
+    const id = Math.max(Date.now(), lastReplyId + 1)
+    lastReplyId = id
     replies.push({
-      seq: replySeq,
+      id,
+      seq: id, // 旧客户端兼容；新客户端只使用 id。
       userId,
       groupId: groupBySession.get(sessionId) ?? '',
       sessionId,
@@ -291,10 +304,30 @@ export function apply(ctx, config) {
       at: Date.now(),
     })
     if (replies.length > config.replyBuffer) replies.splice(0, replies.length - config.replyBuffer)
-    log.info(`[qq-bridge] ${userId} 的回复已入队（seq ${replySeq}，${text.length} 字）`)
+    log.info(`[qq-bridge] ${userId} 的回复已入队（id ${id}，${text.length} 字）`)
   }
 
-  // ── 回复捕获：只认回合最后一段非空文本，中间的工具步骤不外发 ──────────────
+  ctx.tools.register(defineTool({
+    name: 'qq_reply',
+    description: '把回复发回给正在跟你对话的 QQ 用户。回复 QQ 消息时必须调用本工具，不要在普通正文里直接写回复。',
+    parameters: {
+      text: { type: 'string', required: true, description: '要发回 QQ 的回复正文' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean', required: true } } },
+      render: (_args, value) => [{ type: 'text', text: value.ok ? '回复已发出' : '回复发送失败' }],
+    },
+    async execute(args, exec) {
+      const sessionId = exec.agent?.session?.id
+      const userId = sessionId !== undefined ? userBySession.get(sessionId) : undefined
+      if (sessionId === undefined || userId === undefined) return { ok: false }
+      pushReply(userId, sessionId, String(args.text ?? ''))
+      repliedThisTurn.add(sessionId)
+      return { ok: true }
+    },
+  }))
+
+  // 模型忘调 qq_reply 时必须保留的兜底：只发回合最后一段非空文本。
   ctx.on('session/event', (session, event) => {
     const sessionId = session.id
     if (process.env.QQBRIDGE_DEBUG) process.stderr.write(`[qqdbg] ${JSON.stringify(event, (k, v) => (k === 'signal' ? '[signal]' : v)).slice(0, 1200)}\n`)
@@ -309,6 +342,7 @@ export function apply(ctx, config) {
     if (event.type === 'turn/end') {
       const text = pendingText.get(sessionId)
       pendingText.delete(sessionId)
+      if (repliedThisTurn.delete(sessionId)) return
       const userId = userBySession.get(sessionId)
       if (text !== undefined && text !== '' && userId !== undefined) {
         pushReply(userId, sessionId, text)
@@ -431,8 +465,8 @@ export function apply(ctx, config) {
       }
       const since = Number(url.searchParams.get('since') ?? '0')
       const from = Number.isFinite(since) && since > 0 ? since : 0
-      const batch = replies.filter(r => r.seq > from)
-      sendJson(res, 200, { ok: true, replies: batch, nextSeq: replySeq })
+      const batch = replies.filter(r => r.id > from)
+      sendJson(res, 200, { ok: true, replies: batch, nextId: lastReplyId, nextSeq: lastReplyId })
     },
   }), 'qq-bridge: replies route')
 
@@ -443,6 +477,7 @@ export function apply(ctx, config) {
     userBySession.clear()
     groupBySession.clear()
     pendingText.clear()
+    repliedThisTurn.clear()
     replies.length = 0
   }, 'qq-bridge: agent teardown')
 
@@ -450,6 +485,6 @@ export function apply(ctx, config) {
   if (bootAuth.token === '') {
     log.warn('[qq-bridge] inject_token 为空 —— 注入接口不校验口令，任何本机进程都能驱动 agent')
   }
-  log.info(`[qq-bridge] 就绪（preset=${config.agentPreset || '(默认)'}，cwd=${cwd}，`
+  log.info(`[qq-bridge] 就绪（preset=${config.agentPreset || 'standard'}，cwd=${cwd}，`
     + `白名单来源=${bootAuth.source}，名单=${bootAuth.allowed.size === 0 ? '(空)' : [...bootAuth.allowed].join(',')}）`)
 }

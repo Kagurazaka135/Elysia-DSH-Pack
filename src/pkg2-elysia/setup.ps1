@@ -129,36 +129,48 @@ if (-not (Test-Path $settingsPath)) {
     Copy-Item $settingsPath "$settingsPath.bak-pkg2" -Force
     $raw = [IO.File]::ReadAllText($settingsPath)
     $eol = if ($raw -match "`r`n") { "`r`n" } else { "`n" }
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.AddRange([string[]]($raw -split "`r?`n"))
-    $hdr = -1
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^agent-presets:\s*$') { $hdr = $i; break }
-    }
-    if ($hdr -lt 0) {
-        if ($raw.Length -gt 0 -and -not $raw.EndsWith($eol)) { $lines.Add('') }
-        $lines.Add('agent-presets:')
-        $lines.Add('  default: elysia')
+    $updated = $raw
+    $how = $null
+    $headers = [regex]::Matches($raw, '(?m)^agent-presets:[^\r\n]*')
+    if ($headers.Count -eq 0) {
+        if ($updated.Length -gt 0 -and -not $updated.EndsWith("`n")) { $updated += $eol }
+        $updated += 'agent-presets:' + $eol + '  default: elysia' + $eol
         $how = '新增 agent-presets 段'
+    } elseif ($headers.Count -ne 1 -or $headers[0].Value -notmatch '^agent-presets:[ \t]*$') {
+        Say '  跳过默认预设: agent-presets 含注释/复杂值或重复键, 请手动设置 agent-presets.default = elysia' $Yellow
     } else {
-        $defIdx = -1; $indent = '  '; $comment = ''
-        for ($i = $hdr + 1; $i -lt $lines.Count; $i++) {
-            $l = $lines[$i]
-            if ($l -match '^\S') { break }          # 下一段的开头, 本段结束
-            if ($l -match '^\s*$') { continue }
-            if ($l -match '^(\s*)default:') { $defIdx = $i; $indent = $Matches[1]; break }
-        }
-        if ($defIdx -ge 0) {
-            if ($lines[$defIdx] -match '#(.*)$') { $comment = '  #' + $Matches[1] }
-            $lines[$defIdx] = "$indent" + 'default: elysia' + $comment
-            $how = '改写已有的 default'
+        $start = $headers[0].Index + $headers[0].Length
+        $rest = $raw.Substring($start)
+        $nextHeader = [regex]::Match($rest, '(?m)^[^\s#]')
+        $section = if ($nextHeader.Success) { $rest.Substring(0, $nextHeader.Index) } else { $rest }
+        $defaults = [regex]::Matches($section, '(?m)^(?<indent>[ \t]+)default:[ \t]*(?<value>[^\r\n]*)')
+        $children = [regex]::Matches($section, '(?m)^(?<indent>[ \t]+)[^\s#]')
+        $indent = if ($children.Count -gt 0) { $children[0].Groups['indent'].Value } else { '  ' }
+        # 只替换明确的单行标量。块值、多行引号、含 # 的值及嵌套/重复键保守跳过,
+        # 需要用户手动修改; 不重新拼接整份 YAML, 目标键之外的字符保持原样。
+        if ($defaults.Count -eq 1 -and $defaults[0].Groups['indent'].Value -eq $indent -and
+            $defaults[0].Groups['value'].Value -match '^(?:[A-Za-z0-9_-]+|''[^''#]*''|"[^"#]*")[ \t]*$') {
+            $value = $defaults[0].Groups['value']
+            $updated = $raw.Remove($start + $value.Index, $value.Length).Insert($start + $value.Index, 'elysia')
+            $how = '精确改写已有的 default'
+        } elseif ($defaults.Count -gt 0) {
+            Say '  跳过默认预设: default 为块值/含 # 的值或结构复杂, 请手动设置 agent-presets.default = elysia' $Yellow
         } else {
-            $lines.Insert($hdr + 1, '  default: elysia')
+            $insertAt = $start
+            if ($raw.Substring($start).StartsWith("`r`n")) { $insertAt += 2 }
+            elseif ($raw.Substring($start).StartsWith("`n")) { $insertAt += 1 }
+            else { $updated += $eol; $insertAt = $updated.Length }
+            $updated = $updated.Insert($insertAt, $indent + 'default: elysia' + $eol)
             $how = '补上缺失的 default'
         }
     }
-    [IO.File]::WriteAllText($settingsPath, ($lines -join $eol), $script:utf8NoBom)
-    Say "  已设置默认预设 = elysia ($how; 旧文件备份为 settings.yaml.bak-pkg2)" $Green
+    if ($how) {
+        $settingsBytes = [IO.File]::ReadAllBytes($settingsPath)
+        $hadBom = $settingsBytes.Length -ge 3 -and $settingsBytes[0] -eq 239 -and $settingsBytes[1] -eq 187 -and $settingsBytes[2] -eq 191
+        $settingsEncoding = New-Object System.Text.UTF8Encoding($hadBom)
+        [IO.File]::WriteAllText($settingsPath, $updated, $settingsEncoding)
+        Say "  已设置默认预设 = elysia ($how; 旧文件备份为 settings.yaml.bak-pkg2)" $Green
+    }
 }
 
 Say ''
