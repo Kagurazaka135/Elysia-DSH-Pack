@@ -11,6 +11,7 @@
 ## 怎么用
 - 新会话**默认就是爱莉希雅**（安装脚本会改 `~/.dsh/settings.yaml` 里的 `agent-presets.default`）
 - 想切回标准模式：新建会话时手动选「标准模式 / standard」即可
+- 安装前会备份 `settings.yaml.bak-pkg2`。若 `agent-presets.default` 使用块值、多行引号、含 `#` 的值或复杂结构，脚本会警告并跳过；请手动将该项设为 `elysia`。
 - 开口就是爱莉啦！她会用"♪/～/呀/呢"说话，会关心你，会撒娇
 
 ## 装到旧版 dsh 上也能用

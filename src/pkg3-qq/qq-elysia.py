@@ -288,16 +288,23 @@ def load_cursor():
         return 0
 
 def save_cursor(n):
+    tmp = CURSOR + '.tmp'
     try:
-        with open(CURSOR, 'w', encoding='utf-8') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump({'since': n}, f)
+        os.replace(tmp, CURSOR)
     except Exception:
         pass
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 async def poll_replies(ws):
     """轮询 HTTP 接口取真身回复, 发回 QQ。
 
-    新版桥把回复放在内存队列里, 用递增的 seq 做游标 —— 不再有「读-清-写」
+    新版桥把回复放在内存队列里, 用递增的毫秒时间戳 id 做游标 —— 不再有「读-清-写」
     竞态, 也不会因为外部程序晚一步启动就丢回复。游标本身存盘, 所以重启分身
     只会补发「没发过的」, 不会把发过的一股脑重发。
     """
@@ -314,7 +321,7 @@ async def poll_replies(ws):
                 log(f'[轮询错误] {data.get("error")}')
             else:
                 for r in data.get('replies', []):
-                    since = max(since, r.get('seq', 0))
+                    since = max(since, r.get('id', 0))
                     uid = r.get('userId', '')
                     reply = (r.get('text') or '').strip()
                     group_id = r.get('groupId') or None
@@ -336,7 +343,7 @@ async def poll_replies(ws):
                     done = load_json(DONE)
                     done.append({'result': reply, 'time': time.strftime('%H:%M')})
                     save_json(DONE, done[-200:])
-                since = max(since, data.get('nextSeq', 0))
+                since = max(since, data.get('nextId', 0))
         except Exception as e:
             log(f'[轮询错误] {e}')
         if since != saved:
@@ -423,7 +430,6 @@ async def handle_message(ws, msg):
     try:
         msg_id = forward_to_host(text, user_id, group_id, local_images)
         log(f'[已转发] msgId={msg_id}')
-        await send_text(ws, user_id, '嗯哼～爱莉收到啦，正在认真看哦，稍等一下下♪', group_id)
     except ForwardError as e:
         # 话术按状态码区分 (A1 验收): 401 = 口令/token 没同步, 403 = 白名单没同步,
         # 别再一概回"连接有点问题"误导人。
@@ -471,6 +477,8 @@ def ws_connect():
 
 async def main():
     import asyncio
+    if not CFG['bot_qq']:
+        log('[警告] bot_qq 未配置，已用硬编码 2778339130；若与实际小号不符，群聊 @ 判定会失灵')
     if not ALLOWED_USERS:
         log(f'[警告] 白名单为空 —— fail-closed: 所有消息都会被拦截。'
             f'请在 {QQ_CONFIG_PATH} 的 allowed_users 里填 QQ 号数组后重启')
