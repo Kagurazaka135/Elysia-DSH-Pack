@@ -11,10 +11,10 @@
  * 且 agent 作用域按 blockedTools 配置挂权限闸门。
  */
 import { randomUUID } from 'node:crypto'
-import { readFileSync, statSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, extname, isAbsolute } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join } from 'node:path'
 
 import z from '@deepseek-ai/schemastery'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
@@ -41,6 +41,8 @@ export const Config = z.object({
   agentPreset: z.string().default('elysia'),
   /** agent 的工作目录（必须是绝对路径且存在）。留空 = 用户主目录。 */
   cwd: z.string().default(''),
+  /** QQ 会话键到 sessionId 的映射。留空 = <cwd>/tasks/qq-sessions.json。 */
+  sessionStorePath: z.string().default(''),
   /** 准入白名单，逗号分隔的 QQ 号；只在 qq-config.json 缺失时作兜底，
    *  留空 = 谁都能用（兜底语义，会打警告）。 */
   allowedUsers: z.string().default(''),
@@ -236,6 +238,42 @@ export function apply(ctx, config) {
     throw new Error(`dsh-qq-bridge: cwd 必须是绝对路径，收到 ${JSON.stringify(cwd)}`)
   }
 
+  const sessionStorePath = config.sessionStorePath !== ''
+    ? config.sessionStorePath
+    : join(cwd, 'tasks', 'qq-sessions.json')
+
+  function loadSessions() {
+    try {
+      const store = JSON.parse(readFileSync(sessionStorePath, 'utf8'))
+      if (store?.version !== 1 || store.sessions === null || typeof store.sessions !== 'object'
+        || Array.isArray(store.sessions)
+        || !Object.values(store.sessions).every(id => typeof id === 'string' && id !== '')) {
+        throw new Error('会话映射格式无效')
+      }
+      return Object.assign(Object.create(null), store.sessions)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        log.warn(`[qq-bridge] 会话映射读取失败（${error?.name ?? 'Error'}）：${String(error)}，按空映射处理`)
+      }
+      return Object.create(null)
+    }
+  }
+
+  const storedSessions = loadSessions()
+
+  // 持久映射不是缓存：只更新当前键，不因 agent 回收或插件卸载删除其他键。
+  function saveSession(key, sessionId) {
+    storedSessions[key] = sessionId
+    try {
+      mkdirSync(dirname(sessionStorePath), { recursive: true })
+      const tmp = sessionStorePath + '.tmp'
+      writeFileSync(tmp, JSON.stringify({ version: 1, sessions: storedSessions }, null, 2), 'utf8')
+      renameSync(tmp, sessionStorePath)
+    } catch (error) {
+      log.warn(`[qq-bridge] 会话映射写入失败（${error?.name ?? 'Error'}）：${String(error)}，本次消息照常处理`)
+    }
+  }
+
   /**
    * 拿到某个 QQ 号的 agent，没有就按「一人一 agent」建一个。
    * @param userId - QQ 号。
@@ -245,7 +283,6 @@ export function apply(ctx, config) {
     const existing = agentsByUser.get(userId)
     if (existing !== undefined) return existing.handle.agent
 
-    const sessionId = SessionId(`qq-${userId}-${randomUUID()}`)
     const preset = config.agentPreset !== '' ? config.agentPreset : 'standard'
 
     // 没有这一步，prompt 里的 {{model}} / {{provider}} 会注册了却没有值，
@@ -254,39 +291,54 @@ export function apply(ctx, config) {
     const selection = ctx.agentDefaultModel.currentSelection()
     const agentOptions = { provider: selection.provider, model: selection.model }
 
-    const handle = await ctx.agents.create({
-      sessionId,
-      meta: {
-        cwd,
-        agentPreset: preset,
-      },
-      agentOptions,
-      setup: async (agentCtx) => {
-        installModelSelection(agentCtx, { current: selection, assembled: undefined })
-        const blocked = new Set(config.blockedTools.split(',').map(s => s.trim()).filter(s => s !== ''))
-        if (blocked.size > 0) {
-          agentCtx.tools.guard((exec) => {
-            if (blocked.has(exec.name)) return `工具 ${exec.name} 已被 QQ 侧闸门禁用`
-            return undefined
-          })
-        }
-        // 光给 meta.agentPreset 只会在日志里 warning，真正把预设挂上去得在这里显式调。
+    // create 与 resume 共用同一个 setup，续场也必须挂模型选择、闸门和预设。
+    const setup = async (agentCtx) => {
+      installModelSelection(agentCtx, { current: selection, assembled: undefined })
+      const blocked = new Set(config.blockedTools.split(',').map(s => s.trim()).filter(s => s !== ''))
+      if (blocked.size > 0) {
+        agentCtx.tools.guard((exec) => {
+          if (blocked.has(exec.name)) return `工具 ${exec.name} 已被 QQ 侧闸门禁用`
+          return undefined
+        })
+      }
+      // 光给 meta.agentPreset 只会在日志里 warning，真正把预设挂上去得在这里显式调。
+      try {
+        await ctx.agentPresets.mount(agentCtx, preset)
+      } catch (error) {
+        log.warn(`[qq-bridge] 预设 "${preset}" 挂载失败，尝试内置 standard：${String(error)}`)
         try {
-          await ctx.agentPresets.mount(agentCtx, preset)
-        } catch (error) {
-          log.warn(`[qq-bridge] 预设 "${preset}" 挂载失败，尝试内置 standard：${String(error)}`)
-          try {
-            await ctx.agentPresets.mount(agentCtx, 'standard')
-          } catch (fallbackError) {
-            log.warn(`[qq-bridge] standard 也挂载失败，进入无工具模式：${String(fallbackError)}`)
-          }
+          await ctx.agentPresets.mount(agentCtx, 'standard')
+        } catch (fallbackError) {
+          log.warn(`[qq-bridge] standard 也挂载失败，进入无工具模式：${String(fallbackError)}`)
         }
-      },
-    })
+      }
+    }
+
+    const key = `qq-${userId}`
+    const savedId = storedSessions[key]
+    const persistence = ctx.get?.('sessionPersistence')
+    let handle
+    if (savedId !== undefined && persistence !== undefined) {
+      try {
+        handle = await ctx.agents.resume({ resumeSessionId: SessionId(savedId), agentOptions, setup })
+      } catch (error) {
+        log.warn(`[qq-bridge] 会话续场失败（${error?.name ?? 'Error'}）：${String(error)}，改建全新会话`)
+      }
+    }
+    if (handle === undefined) {
+      handle = await ctx.agents.create({
+        sessionId: SessionId(`${key}-${randomUUID()}`),
+        meta: { cwd, agentPreset: preset },
+        agentOptions,
+        setup,
+      })
+    }
+    const sessionId = handle.agent.session.id
+    saveSession(key, sessionId)
 
     agentsByUser.set(userId, { handle, sessionId })
     userBySession.set(sessionId, userId)
-    log.info(`[qq-bridge] 为 ${userId} 建了新 agent（session ${sessionId}，preset ${preset}）`)
+    log.info(`[qq-bridge] 为 ${userId} 建立 agent（session ${sessionId}，preset ${preset}）`)
     return handle.agent
   }
 
