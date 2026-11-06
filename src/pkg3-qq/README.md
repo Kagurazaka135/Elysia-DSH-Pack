@@ -27,8 +27,8 @@
 
 ## 包内容
 ```
-qq-elysia.py    # QQ 分身（消息收发+语音）
-plugin/         # DSH 插件（QQ↔DSH 的桥，install.bat 会自动装进 DSH）
+mods/qq/qq-elysia.py    # QQ 分身（消息收发+语音）
+mods/qq/plugin/         # DSH 插件（QQ↔DSH 的桥，install.bat 会自动装进 DSH）
 install.bat
 README.md
 ```

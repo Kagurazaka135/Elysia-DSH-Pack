@@ -27,7 +27,7 @@
   不便二次分发。需要的话请到原包处获取，放进 `voice-clips/` 即可被脚本识别。
   （`.gitignore` 已经把 `*.wav` 挡在外面了。）
 - **dsh 本体** —— 由包1 安装脚本从 npm 现装，本仓库不含也不分发。
-- **CosyVoice 语音引擎**（约 3GB）—— 需要自己下载，见包2 的 `docs/voice-guide.md`。
+- **CosyVoice 语音引擎**（约 3GB）—— 需要自己下载，见包2 的 `mods/persona/docs/voice-guide.md`。
 
 ---
 
@@ -38,14 +38,14 @@
 | 包 | 作用 | 必须？ |
 |---|---|---|
 | **`elysia-pkg1-core.zip`** | 装 Node.js → `npm install -g @deepseek-ai/dsh@0.1.6-alpha.2` → 收 API Key → 后台起 `dsh web` → 生成桌面启动器 | ✅ 必须 |
-| **`elysia-pkg2-elysia.zip`** | 装爱莉人格预设，设为默认 | 推荐 |
+| **`elysia-pkg2-persona.zip`** | 装爱莉人格预设，设为默认 | 推荐 |
 | **`elysia-pkg3-qq.zip`** | 接 QQ（NapCat 自动下载，钉版本 + sha256 校验） | 可选 |
 | **`elysia-pkg4-video.zip`** | 视频理解：内容总结 / 抽帧 / 场景检测 / GIF / 元数据（需自备 [ffmpeg](https://www.gyan.dev/ffmpeg/builds/)，脚本会检查并给指引） | 可选 |
 
 ### 安装
 
 1. 解压 `packages/` 里的 **`elysia-pkg1-core.zip`**，双击里面的 `install.bat`
-2. （推荐）同理解压并双击 `elysia-pkg2-elysia.zip`
+2. （推荐）同理解压并双击 `elysia-pkg2-persona.zip`
 3. （可选）同理解压 `elysia-pkg3-qq.zip` 并双击——需要先自己下载 NapCat
 4. （可选）同理解压 `elysia-pkg4-video.zip` 并双击——机器上最好先装好 ffmpeg，
    没装脚本也会停下来给指引（推荐 `winget install Gyan.FFmpeg`）
@@ -269,9 +269,10 @@ v1.0.0 那份 Release 就是搬之前的快照，留着兜底用；本仓库的 
 
 ```
 packages/            # 四个可直接下载的安装包（解压双击 install.bat 即可）
-src/                 # 同一份内容展开成源码，给想改/想审查的人
+mods/                # 唯一功能源码：persona/、qq/、video/
+src/                 # 仅安装器：install.bat + setup.ps1 + README.md
 ├── pkg1-core/
-├── pkg2-elysia/
+├── pkg2-persona/
 ├── pkg3-qq/
 └── pkg4-video/
 ```
@@ -280,8 +281,8 @@ src/                 # 同一份内容展开成源码，给想改/想审查的�
 `install.bat` 本身是「提权 + 解码 + 执行」的外壳，逻辑全在 `setup.ps1` 里，想看改了什么直接 diff 这个。
 
 > **改 `setup.ps1` 后必须重打包进 `install.bat`，否则装的时候跑的还是旧逻辑。**
-> 直接跑 `python tools/repack.py`（`--check` 只校验不写入）：自动把四个包的 `src/`
-> 重打进 `packages/*.zip`，做 round-trip 断言，并把 zip 里的 `install.bat` 统一成 **CRLF**。
+> 直接跑 `python tools/repack.py`（`--check` 只校验不写入）：自动把安装器 `src/` 和功能载荷 `mods/`
+> 组装进 `packages/*.zip`，做 round-trip 断言，并把 zip 里的 `install.bat` 统一成 **CRLF**。
 > 内嵌载荷的编码约定：把 `setup.ps1` 读成文本 → 去掉已有的 BOM → 换行统一成 **LF** →
 > 按 **UTF-8 带 BOM** 编码 → base64 → 每 **100** 字符一行，包在
 > `-----BEGIN/END CERTIFICATE-----` 之间，每行前缀 `>>"%B64%" echo `。

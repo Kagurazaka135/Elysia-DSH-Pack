@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""把 src/ 重新打进 packages/ 里的四个 zip（src ↔ zip 对齐）。
+"""把 src/ 安装器与 mods/ 载荷组装进 packages/ 里的五个 zip。
 
 install.bat 是 base64 包着 PowerShell 的 (certutil -decode)，改 setup.ps1 必须
 重新编码塞回 BEGIN/END CERTIFICATE 之间。编码约定（与根 README 一致）：
@@ -9,7 +9,7 @@ install.bat 是 base64 包着 PowerShell 的 (certutil -decode)，改 setup.ps1 
     （每行前缀 >>"%B64%" echo ；那个 BOM 不可省：PS5.1 没 BOM 会按 ANSI
     解码 UTF-8，中文全乱、甚至报不存在的语法错误）
 
-其余文件一律以 src/ 为准原字节替换 / 新增，保证 packages/*.zip 与 src/ 对齐。
+其余文件以 src/、mods/ 为准原字节组装，zip 不保留旧布局条目。
 A2：zip 里的 install.bat 统一 CRLF（旧包是 LF-only）。
 
 每一步都带断言：payload round-trip、bat 骨架未破坏、CRLF、写完后再读回核验。
@@ -26,17 +26,23 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, 'src')
+MODS = os.path.join(ROOT, 'mods')
 PKG = os.path.join(ROOT, 'packages')
 WRAP = 100
 BACKUP = '.before-feat'          # 重打包前的 zip 备份后缀
 BEGIN, END = '-----BEGIN CERTIFICATE-----', '-----END CERTIFICATE-----'
 
-PACKAGES = ['pkg1-core', 'pkg2-elysia', 'pkg3-qq', 'pkg4-video']
+PACKAGES = ['pkg1-core', 'pkg2-persona', 'pkg3-qq', 'pkg4-video', 'pkg5-memory']
 ZIP_NAMES = {
     'pkg1-core': 'elysia-pkg1-core.zip',
-    'pkg2-elysia': 'elysia-pkg2-elysia.zip',
+    'pkg2-persona': 'elysia-pkg2-persona.zip',
     'pkg3-qq': 'elysia-pkg3-qq.zip',
     'pkg4-video': 'elysia-pkg4-video.zip',
+    'pkg5-memory': 'elysia-pkg5-memory.zip',
+}
+PAYLOAD = {
+    'pkg1-core': [], 'pkg2-persona': ['persona'], 'pkg3-qq': ['qq'],
+    'pkg4-video': ['video'], 'pkg5-memory': ['memory'],
 }
 
 
@@ -81,36 +87,42 @@ def build_updates(pkg):
     package-lock.json (本机测试 npm install 的副产物, 维持现包"不带
     lockfile、装机时现装"的行为)。
     """
-    src_dir = os.path.join(SRC, pkg)
     updates = {}
-    for dirpath, dirnames, filenames in os.walk(src_dir):
-        dirnames[:] = [d for d in dirnames if d not in ('node_modules', '__pycache__')]
-        for fn in filenames:
-            if fn == 'setup.ps1' or fn.endswith('.pyc') or fn == 'package-lock.json':
-                continue
-            full = os.path.join(dirpath, fn)
-            rel = os.path.relpath(full, src_dir).replace('\\', '/')
-            data = open(full, 'rb').read()
-            if rel == 'install.bat':
-                data = encode_bat(data, payload_bytes(os.path.join(src_dir, 'setup.ps1')))
-            updates[rel] = data
+    sources = [(os.path.join(SRC, pkg), '')]
+    sources += [(os.path.join(MODS, mod), f'mods/{mod}/') for mod in PAYLOAD[pkg]]
+    for source_dir, prefix in sources:
+        if not os.path.isdir(source_dir):
+            raise FileNotFoundError(f'缺少源码目录: {source_dir}')
+        for dirpath, dirnames, filenames in os.walk(source_dir):
+            dirnames[:] = sorted(d for d in dirnames if d not in ('node_modules', '__pycache__'))
+            for fn in sorted(filenames):
+                if fn == 'setup.ps1' or fn.endswith('.pyc') or fn == 'package-lock.json':
+                    continue
+                full = os.path.join(dirpath, fn)
+                rel = prefix + os.path.relpath(full, source_dir).replace('\\', '/')
+                data = open(full, 'rb').read()
+                if rel == 'install.bat':
+                    data = encode_bat(data, payload_bytes(os.path.join(SRC, pkg, 'setup.ps1')))
+                updates[rel] = data
     return updates
 
 
 def rebuild(zip_path, updates, dry):
     bak = zip_path + BACKUP
-    if not dry and not os.path.exists(bak):
+    if not dry and os.path.exists(zip_path) and not os.path.exists(bak):
         shutil.copy2(zip_path, bak)
         print(f'  备份 -> {os.path.basename(bak)}')
-    with zipfile.ZipFile(zip_path) as zin:
-        items = [(i, zin.read(i.filename)) for i in zin.infolist()]
+    items = []
+    if os.path.exists(zip_path):
+        with zipfile.ZipFile(zip_path) as zin:
+            items = [(i, zin.read(i.filename)) for i in zin.infolist()]
     zip_names = {i.filename for i, _ in items}
     new_names = set(updates) - zip_names
     if new_names:
         print(f'  新增条目: {sorted(new_names)}')
-    missing = zip_names - set(updates) - {p + BACKUP for p in []}
+    missing = zip_names - set(updates)
     if missing:
-        print(f'  !! zip 里有但 src 没有（原样保留）: {sorted(missing)}')
+        print(f'  删除旧布局条目: {sorted(missing)}')
     if dry:
         for name, data in updates.items():
             old = dict((i.filename, d) for i, d in items).get(name)
@@ -121,8 +133,7 @@ def rebuild(zip_path, updates, dry):
     out = []
     for info, data in items:
         if info.filename in updates:
-            data = updates[info.filename]
-        out.append((info, data))
+            out.append((info, updates[info.filename]))
     for name, data in updates.items():
         if name in zip_names:
             continue
@@ -140,6 +151,7 @@ def verify(zip_path, updates, pkg):
     """写完后读回：逐文件与期望一致；install.bat 另验 round-trip/CRLF/BOM。"""
     with zipfile.ZipFile(zip_path) as z:
         names = set(z.namelist())
+        assert names == set(updates), f'{zip_path}: 条目与源码布局不一致'
         for name, want in updates.items():
             assert name in names, f'{zip_path}: 缺条目 {name}'
             got = z.read(name)
@@ -167,8 +179,7 @@ def main():
         print(f'{pkg}:')
         updates = build_updates(pkg)
         rebuild(zip_path, updates, dry)
-        if not dry:
-            verify(zip_path, updates, pkg)
+        verify(zip_path, updates, pkg)
     print('完成' + ('（dry-run，未写入）' if dry else ''))
 
 

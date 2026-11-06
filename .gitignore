@@ -12,6 +12,7 @@ reply-cursor.json
 # 开发过程中的交接单/工作底稿/验收报告（含本地路径与测试用 QQ 号），不进公开仓库
 HANDOFF-*.md
 ZCode-*.md
+任务书-*.md
 
 # 改进计划总纲（1.0=Python 补丁 / 2.0=插件化最终目标）——内部文档不公开，
 # zcode 在本机直接读文件；archive 原件在 G:\code\_archive\elysia-pack-旧材料-2026-10-01\
@@ -23,6 +24,7 @@ __pycache__/
 
 # 测试 npm install 的副产物: 约定不进库也不进包 (与现包行为一致)
 src/**/package-lock.json
+mods/**/package-lock.json
 
 # 重打包前备份 (tools/repack.py 生成, 本地留存)
 packages/*.zip.before-*

@@ -53,12 +53,12 @@ Say '  OK dsh + pnpm 都在' $Green
 
 # ---------- [2/5] 复制脚本与插件 ----------
 Say '[2/5] 复制脚本与插件 ...'
-Copy-Item (Join-Path $scriptDir 'qq-elysia.py') (Join-Path $base 'qq-elysia.py') -Force
+Copy-Item (Join-Path $scriptDir 'mods\qq\qq-elysia.py') (Join-Path $base 'qq-elysia.py') -Force
 New-Item -ItemType Directory -Path (Join-Path $base 'tasks') -Force | Out-Null
 
 $pluginDir = Join-Path $base 'dsh-qq-bridge'
 New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
-Copy-Item (Join-Path $scriptDir 'plugin\*') $pluginDir -Recurse -Force
+Copy-Item (Join-Path $scriptDir 'mods\qq\plugin\*') $pluginDir -Recurse -Force
 Say '  OK 已复制到 D:\AI\JARVIS' $Green
 
 # ---------- [2.5/5] 安全配置: 白名单 + 共享口令 ----------
