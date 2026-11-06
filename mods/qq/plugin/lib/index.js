@@ -7,7 +7,7 @@
  *
  * 回复主要由模型调用 qq_reply 提交；session/event 抓取回合最后一段文本作兜底。
  *
- * 一个 QQ 号 = 一个 agent = 一条会话，所以不同用户的上下文天然隔离，
+ * 每个 QQ 用户的私聊、各群分别建立 agent 和会话，
  * 且 agent 作用域按 blockedTools 配置挂权限闸门。
  */
 import { randomUUID } from 'node:crypto'
@@ -141,12 +141,10 @@ export async function toImageBlocks(attachments, localPaths, log) {
 export function apply(ctx, config) {
   const log = ctx.logger
 
-  /** userId -> { handle, sessionId } */
-  const agentsByUser = new Map()
-  /** sessionId -> userId，回复回来时用来找主人。 */
+  /** conversationKey -> { handle, sessionId } */
+  const agentsByConversation = new Map()
+  /** sessionId -> { userId, groupId }，回复回到会话创建时确定的窗口。 */
   const userBySession = new Map()
-  /** sessionId -> groupId（私聊为空串），好让回复发回群里而不是发成私聊。 */
-  const groupBySession = new Map()
   /** sessionId -> 当前回合最后一段非空 assistant 文本。 */
   const pendingText = new Map()
   /** 本回合已通过 qq_reply 回复的 session，避免事件兜底重复入队。 */
@@ -275,12 +273,20 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 拿到某个 QQ 号的 agent，没有就按「一人一 agent」建一个。
+   * 私聊与每个群各有一条会话；不扫描或迁移升级前的旧会话。
+   */
+  function conversationKey(userId, groupId) {
+    return groupId !== '' ? `qq-${userId}-g-${groupId}` : `qq-${userId}`
+  }
+
+  /**
+   * 拿到用户在当前私聊或群聊的 agent。
    * @param userId - QQ 号。
    * @returns 该用户的 agent handle。
    */
-  async function agentFor(userId) {
-    const existing = agentsByUser.get(userId)
+  async function agentFor(userId, groupId) {
+    const key = conversationKey(userId, groupId)
+    const existing = agentsByConversation.get(key)
     if (existing !== undefined) return existing.handle.agent
 
     const preset = config.agentPreset !== '' ? config.agentPreset : 'standard'
@@ -295,8 +301,11 @@ export function apply(ctx, config) {
     const setup = async (agentCtx) => {
       installModelSelection(agentCtx, { current: selection, assembled: undefined })
       const blocked = new Set(config.blockedTools.split(',').map(s => s.trim()).filter(s => s !== ''))
-      if (blocked.size > 0) {
+      if (blocked.size > 0 || groupId !== '') {
         agentCtx.tools.guard((exec) => {
+          if (groupId !== '' && exec.name.startsWith('memory_')) {
+            return `工具 ${exec.name} 已被 QQ 群聊记忆闸门禁用`
+          }
           if (blocked.has(exec.name)) return `工具 ${exec.name} 已被 QQ 侧闸门禁用`
           return undefined
         })
@@ -314,7 +323,6 @@ export function apply(ctx, config) {
       }
     }
 
-    const key = `qq-${userId}`
     const savedId = storedSessions[key]
     const persistence = ctx.get?.('sessionPersistence')
     let handle
@@ -336,8 +344,8 @@ export function apply(ctx, config) {
     const sessionId = handle.agent.session.id
     saveSession(key, sessionId)
 
-    agentsByUser.set(userId, { handle, sessionId })
-    userBySession.set(sessionId, userId)
+    agentsByConversation.set(key, { handle, sessionId })
+    userBySession.set(sessionId, { userId, groupId })
     log.info(`[qq-bridge] 为 ${userId} 建立 agent（session ${sessionId}，preset ${preset}）`)
     return handle.agent
   }
@@ -350,7 +358,7 @@ export function apply(ctx, config) {
       id,
       seq: id, // 旧客户端兼容；新客户端只使用 id。
       userId,
-      groupId: groupBySession.get(sessionId) ?? '',
+      groupId: userBySession.get(sessionId)?.groupId ?? '',
       sessionId,
       text,
       at: Date.now(),
@@ -371,9 +379,9 @@ export function apply(ctx, config) {
     },
     async execute(args, exec) {
       const sessionId = exec.agent?.session?.id
-      const userId = sessionId !== undefined ? userBySession.get(sessionId) : undefined
-      if (sessionId === undefined || userId === undefined) return { ok: false }
-      pushReply(userId, sessionId, String(args.text ?? ''))
+      const conversation = sessionId !== undefined ? userBySession.get(sessionId) : undefined
+      if (sessionId === undefined || conversation === undefined) return { ok: false }
+      pushReply(conversation.userId, sessionId, String(args.text ?? ''))
       repliedThisTurn.add(sessionId)
       return { ok: true }
     },
@@ -395,9 +403,9 @@ export function apply(ctx, config) {
       const text = pendingText.get(sessionId)
       pendingText.delete(sessionId)
       if (repliedThisTurn.delete(sessionId)) return
-      const userId = userBySession.get(sessionId)
-      if (text !== undefined && text !== '' && userId !== undefined) {
-        pushReply(userId, sessionId, text)
+      const conversation = userBySession.get(sessionId)
+      if (text !== undefined && text !== '' && conversation !== undefined) {
+        pushReply(conversation.userId, sessionId, text)
       }
     }
   })
@@ -464,10 +472,8 @@ export function apply(ctx, config) {
       }
 
       try {
-        const agent = await agentFor(userId)
+        const agent = await agentFor(userId, groupId)
         if (process.env.QQBRIDGE_DEBUG) process.stderr.write(`[qqdbg] agent.session.id=${agent.session.id} agentStatus=${JSON.stringify(agent.status ?? null)}\n`)
-        // 记住这条会话最近一次是从哪儿来的，回复时才不会把群消息发成私聊。
-        groupBySession.set(agent.session.id, groupId)
         const from = groupId !== '' ? `群 ${groupId}` : `私聊 ${userId}`
 
         // 看图（二阶段 P2-4）：先过能力硬门，再落盘换 image block。
@@ -524,10 +530,9 @@ export function apply(ctx, config) {
 
   // 插件卸载时把建过的 agent 收干净。
   ctx.effect(() => () => {
-    for (const { handle } of agentsByUser.values()) handle.dispose()
-    agentsByUser.clear()
+    for (const { handle } of agentsByConversation.values()) handle.dispose()
+    agentsByConversation.clear()
     userBySession.clear()
-    groupBySession.clear()
     pendingText.clear()
     repliedThisTurn.clear()
     replies.length = 0
