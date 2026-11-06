@@ -1,0 +1,6 @@
+# dsh-memory bundle patch: 挂载分层记忆插件（L3 版本化事实 + L4 摘要 + 夜间整理）。
+# dsh ≥ 0.2.0-rc.2：装上后自动注册「记忆整理」定时任务（自动化任务页可见）；
+# 旧版本无 ctx.schedule 服务时自动降级为仅记忆工具，不报错。
+- insert:
+    - id: dsh-memory
+      name: 'dsh-memory'

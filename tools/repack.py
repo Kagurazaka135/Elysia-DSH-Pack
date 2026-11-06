@@ -178,6 +178,11 @@ def main():
         zip_path = os.path.join(PKG, ZIP_NAMES[pkg])
         print(f'{pkg}:')
         updates = build_updates(pkg)
+        if not dry:
+            # 可读 PS1 是逻辑真源；源码安装入口和 zip 同步使用重新编码后的载荷。
+            bat_path = os.path.join(SRC, pkg, 'install.bat')
+            with open(bat_path, 'wb') as bat:
+                bat.write(updates['install.bat'])
         rebuild(zip_path, updates, dry)
         verify(zip_path, updates, pkg)
     print('完成' + ('（dry-run，未写入）' if dry else ''))
