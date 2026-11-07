@@ -34,7 +34,7 @@ Say '  OK' $Green
 Say '[2/3] 安装爱莉人格 ...'
 $presetDir = Join-Path $dshHome '.agent-presets\elysia'
 New-Item -ItemType Directory -Path $presetDir -Force | Out-Null
-$presetSrc = Join-Path $scriptDir 'preset'
+$presetSrc = Join-Path $scriptDir 'mods\persona\preset'
 $composePath = Join-Path $presetDir 'agent.cordis.yml'
 if (Test-Path (Join-Path $presetSrc 'agent.cordis.yml')) {
     Copy-Item (Join-Path $presetSrc '*') $presetDir -Recurse -Force
@@ -117,7 +117,7 @@ Say '  CosyVoice 模型(约3GB) 需手动下载:' $Yellow
 Say '    1. https://modelscope.cn/models/iic/CosyVoice2-0.5B'
 Say '    2. 模型解压到 D:\AI\JARVIS\models\cosyvoice2\'
 Say '    3. 声线文件放 D:\AI\JARVIS\models\elysia-voice\clips\guide-elysia\'
-Say '  详细步骤见 docs\voice-guide.md (跟分身 qq-elysia.py 找的路径一致)' $Yellow
+Say '  详细步骤见 mods\persona\docs\voice-guide.md (跟分身 qq-elysia.py 找的路径一致)' $Yellow
 
 # 设置默认预设为 elysia
 #   注意: settings.yaml 里往往已经有 agent-presets 段 (Web 设置页写过默认值),

@@ -76,7 +76,7 @@ if ($ff -and $fp) {
 Say '[2/4] 复制插件 ...'
 $pluginDir = Join-Path $base 'dsh-video-frames'
 New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
-Copy-Item (Join-Path $scriptDir 'plugin\*') $pluginDir -Recurse -Force
+Copy-Item (Join-Path $scriptDir 'mods\video\plugin\*') $pluginDir -Recurse -Force
 Say '  OK 已复制到 D:\AI\JARVIS\dsh-video-frames' $Green
 
 # ---------- [3/4] 安装插件依赖 ----------

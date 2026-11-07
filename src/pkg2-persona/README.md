@@ -36,13 +36,13 @@ DSH 会把整个预设标成**「加载失败」**（红标签，选都选不了
    - 下载：https://modelscope.cn/models/iic/CosyVoice2-0.5B
    - 模型解压到 `D:\AI\JARVIS\models\cosyvoice2\`
    - 声线文件放 `D:\AI\JARVIS\models\elysia-voice\clips\guide-elysia\`
-   - 完整步骤见 `docs/voice-guide.md`
+   - 完整步骤见 `mods/persona/docs/voice-guide.md`
 
 ## 包内容
 ```
-preset/                  # 爱莉人格（agent.cordis.yml + 人格文档）
+mods/persona/preset/     # 爱莉人格（agent.cordis.yml + 人格文档）
 install.bat              # 一键安装（内嵌 PowerShell 脚本）
-docs/voice-guide.md      # 语音引擎安装指南
+mods/persona/docs/voice-guide.md      # 语音引擎安装指南
 README.md                # 本文件
 ```
 

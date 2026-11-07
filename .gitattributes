@@ -1,0 +1,2 @@
+# Vendored memory payload must keep the upstream commit's exact bytes.
+mods/memory/** -text

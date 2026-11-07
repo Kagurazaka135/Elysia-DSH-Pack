@@ -27,28 +27,30 @@
   不便二次分发。需要的话请到原包处获取，放进 `voice-clips/` 即可被脚本识别。
   （`.gitignore` 已经把 `*.wav` 挡在外面了。）
 - **dsh 本体** —— 由包1 安装脚本从 npm 现装，本仓库不含也不分发。
-- **CosyVoice 语音引擎**（约 3GB）—— 需要自己下载，见包2 的 `docs/voice-guide.md`。
+- **CosyVoice 语音引擎**（约 3GB）—— 需要自己下载，见包2 的 `mods/persona/docs/voice-guide.md`。
 
 ---
 
 ## 装什么
 
-四个包，按顺序装：
+五个包，包1 是核心，其余每包一个可选 mod：
 
 | 包 | 作用 | 必须？ |
 |---|---|---|
 | **`elysia-pkg1-core.zip`** | 装 Node.js → `npm install -g @deepseek-ai/dsh@0.1.6-alpha.2` → 收 API Key → 后台起 `dsh web` → 生成桌面启动器 | ✅ 必须 |
-| **`elysia-pkg2-elysia.zip`** | 装爱莉人格预设，设为默认 | 推荐 |
+| **`elysia-pkg2-persona.zip`** | 装爱莉人格预设，设为默认 | 推荐 |
 | **`elysia-pkg3-qq.zip`** | 接 QQ（NapCat 自动下载，钉版本 + sha256 校验） | 可选 |
 | **`elysia-pkg4-video.zip`** | 视频理解：内容总结 / 抽帧 / 场景检测 / GIF / 元数据（需自备 [ffmpeg](https://www.gyan.dev/ffmpeg/builds/)，脚本会检查并给指引） | 可选 |
+| **`elysia-pkg5-memory.zip`** | 独立长期记忆 bundle：事实、候选线索、简报、手动整理；不依赖人格包 | 可选 |
 
 ### 安装
 
 1. 解压 `packages/` 里的 **`elysia-pkg1-core.zip`**，双击里面的 `install.bat`
-2. （推荐）同理解压并双击 `elysia-pkg2-elysia.zip`
+2. （推荐）同理解压并双击 `elysia-pkg2-persona.zip`
 3. （可选）同理解压 `elysia-pkg3-qq.zip` 并双击——需要先自己下载 NapCat
 4. （可选）同理解压 `elysia-pkg4-video.zip` 并双击——机器上最好先装好 ffmpeg，
    没装脚本也会停下来给指引（推荐 `winget install Gyan.FFmpeg`）
+5. （可选）同理解压 `elysia-pkg5-memory.zip` 并双击——已有 `dsh-memory` 会跳过；装完重启 dsh
 
 每个包里都有一份 `README.md` 写详细步骤。
 
@@ -56,11 +58,13 @@
 
 ## 版本：装哪个
 
-两个 Release，**包名、安装方式完全一样**，区别只在 QQ 桥内部怎么实现：
+当前源码提供五包 mod 布局、QQ 会话映射与续场、独立记忆包，尚未创建对应 Release。
+从源码下载 `packages/` 可取得本版五包；下面的 v2/v1 链接保留为历史版本，仍使用各自发布时的包名与布局。
 
 | Release | 内部实现 | 适合谁 |
 |---|---|---|
-| **[v2.0.0 · 第二阶段插件化](https://github.com/Kagurazaka135/Elysia-DSH-Pack/releases/tag/v2.0.0)**（推荐） | 回复由模型调 `qq_reply` 工具提交；每个 QQ 用户挂工具闸门；回复游标是毫秒时间戳 | 新装 |
+| **当前源码 · Mod 整合版（未发布）** | 每包一个 mod；QQ 私聊与各群分会话、持久映射与 resume；独立 dsh-memory 0.2.4 | 接受本轮 C/D/E 待验收状态的用户 |
+| **[v2.0.0 · 第二阶段插件化](https://github.com/Kagurazaka135/Elysia-DSH-Pack/releases/tag/v2.0.0)** | 回复由模型调 `qq_reply` 工具提交；每个 QQ 用户挂工具闸门；回复游标是毫秒时间戳 | 使用已发布版本 |
 | **[v1.0.0 · 第一阶段稳定版](https://github.com/Kagurazaka135/Elysia-DSH-Pack/releases/tag/v1.0.0)** | 回复靠 `session/event` 旁听回合、取最后一段文本；进程内计数游标；无工具闸门 | 已经在用、不想动，或 v2 出问题想退回 |
 
 一句话：**v1 是「桥在旁听」，v2 是「模型主动交稿」。**
@@ -81,7 +85,7 @@ v2 用毫秒时间戳当 id，重启后接着往上走，不丢也不重发。
 
 ## 架构一览
 
-一张图看懂装完之后各部件怎么连（`dsh web` 是内核，四个包往它上面叠）：
+一张图看懂装完之后各部件怎么连（`dsh web` 是内核，五个包往它上面叠）：
 
 ```mermaid
 flowchart TB
@@ -91,6 +95,7 @@ flowchart TB
     subgraph DSH["dsh web · :3080 · profile: web"]
         BR["dsh-qq-bridge<br/>(pkg3)"]
         VF["dsh-video-frames<br/>(pkg4)"]
+        MEM["dsh-memory<br/>(pkg5 · 可选)"]
         AG["爱莉 agent<br/>(preset: elysia)"]
     end
 
@@ -105,6 +110,7 @@ flowchart TB
     PY <-->|"HTTP /api/qq/*"| BR
     BR --> AG
     AG -->|"调工具"| VF
+    AG -->|"记忆工具 / 简报"| MEM
     VF -->|"抽帧"| FF
     AG -->|"每回合"| LLM
 ```
@@ -114,7 +120,7 @@ flowchart TB
 - **视频线**（pkg4）：爱莉调 `video_analyze` → `ffmpeg` 抽关键帧 → 喂视觉模型 → 返回画面描述。
 - **大脑**：所有回合最终都打到 DeepSeek API（装了 pkg4 时，总结画面用的是支持图像的 `deepseek-flash`）。
 
-**四个包分别叠在哪：**
+**五个包分别叠在哪：**
 
 ```
 web profile 的 bundle 栈（从上到下即加载顺序）：
@@ -123,6 +129,7 @@ web profile 的 bundle 栈（从上到下即加载顺序）：
   dsh-web-app             ← 网页界面，dsh 自带
   dsh-qq-bridge           ← pkg3 装的
   dsh-video-frames        ← pkg4 装的
+  dsh-memory              ← pkg5 装的（独立 bundle）
   profiles/web/cordis.patch.yml   ← 覆盖层（安装脚本写 agentPreset / cwd 等）
 
 pkg1 = 把 dsh 本体 + web profile 装上、收 API Key、起服务
@@ -148,7 +155,7 @@ pkg2 = 往 ~/.dsh/.agent-presets/ 塞「爱莉」人格预设，并设为默认
 这么改的意义不只是"干净"：**权限和回复都发生在 dsh 的调用点上**，
 Python 侧只能挡住"QQ 这一条路"，而闸门挡住的是**所有路径**。
 
-v1.0.0 那份 Release 就是搬之前的快照，留着兜底用；本仓库的 `master` 已经是 v2。
+v1.0.0、v2.0.0 是历史快照，留着兜底用；当前源码在 v2 基础上继续做 mod 化与记忆补齐。
 
 ### 包1 · 核心包
 
@@ -196,7 +203,7 @@ v1.0.0 那份 Release 就是搬之前的快照，留着兜底用；本仓库的 
 | 装载方式 | 会话里贴代码片段 | 标准 bundle 插件，`dsh plugin add` 自动装 |
 | 路由 `kind` | `'json'`（**非法值**，静默落进 prefix 表） | `'exact'` |
 | 请求体读取 | 无上限 | 有界读取 |
-| agent 归属 | 所有 QQ 用户**共用一条会话** | 一人一个 agent，上下文隔离 |
+| agent 归属 | 所有 QQ 用户**共用一条会话** | 每个用户的私聊、各群各自一个 agent，上下文隔离 |
 | 鉴权 | 无 | 支持共享 token，安装时生成；白名单/口令**单源** `D:\AI\JARVIS\qq-config.json`（插件每次注入都重读，改完重启分身即生效，dsh 不用动） |
 | WS 鉴权 | `onebot11.json` 的 token 留空 | 安装时生成 token，分身连接带 Bearer 头 |
 | 发送者白名单 | 无，谁发都回 | 安装时必填；非白名单直接拦截（分身 fail-closed，插件同源同语义双保险） |
@@ -238,6 +245,11 @@ v1.0.0 那份 Release 就是搬之前的快照，留着兜底用；本仓库的 
 
 ## 已知限制
 
+- **本轮验收边界**：只做 A/B 层静态、打包、代码审读与模拟检查。C 真 dsh 加载、D Windows 安装器、E QQ/模型端到端均未实跑：环境不具备，交回维护者。下列 v2 历史测试不代表本轮已通过 C/D/E。
+- **会话续场**：映射默认保存在工作目录的 `tasks/qq-sessions.json`，可用 `sessionStorePath` 指定；续场依赖可选 `sessionPersistence` 服务。失败会告警、换新 ID，映射不随插件卸载删除。升级前没有映射的旧会话不会自动接续。
+- **群聊记忆**：强制拒绝 `memory_*` 调用，但名称仍可能出现在工具清单中。共享简报仍可能自动注入群聊，其他文件工具也可能读取记忆目录，因此这不是完整的记忆隔离；本轮按指定 guard 实现，E5“工具清单不可见”未满足。
+- **自动整理**：记忆插件的定时整理需要 `schedule` 服务；本包钉住的 web profile 没有该服务，仅支持按需手动整理，不额外安装定时服务。
+- **人格预设兼容性**：宿主记忆工具对 `elysia` preset 的可见性及实际读写效果待维护者验收。
 - **图片（QQ 面）**：链路已通，但**默认模型必须支持视觉**才真看得见——包1 新装默认
   `deepseek-flash`（dsh 目录里声明的文本+图像模型）。已装过的老环境若默认还是
   `deepseek-v4-flash`（不在 dsh 目录里 = 纯文本路由），QQ 发图只会得到"看不了图"
@@ -268,20 +280,22 @@ v1.0.0 那份 Release 就是搬之前的快照，留着兜底用；本仓库的 
 ## 目录结构
 
 ```
-packages/            # 四个可直接下载的安装包（解压双击 install.bat 即可）
-src/                 # 同一份内容展开成源码，给想改/想审查的人
+packages/            # 五个安装包（解压双击 install.bat 即可）
+mods/                # 唯一功能源码：persona/、qq/、memory/、video/
+src/                 # 仅安装器：install.bat + setup.ps1 + README.md
 ├── pkg1-core/
-├── pkg2-elysia/
+├── pkg2-persona/
 ├── pkg3-qq/
-└── pkg4-video/
+├── pkg4-video/
+└── pkg5-memory/
 ```
 
 `src/` 里每个包的 `setup.ps1` 是把 `install.bat` 里 base64 打包的 PowerShell **解码后的可读版本** ——
 `install.bat` 本身是「提权 + 解码 + 执行」的外壳，逻辑全在 `setup.ps1` 里，想看改了什么直接 diff 这个。
 
 > **改 `setup.ps1` 后必须重打包进 `install.bat`，否则装的时候跑的还是旧逻辑。**
-> 直接跑 `python tools/repack.py`（`--check` 只校验不写入）：自动把四个包的 `src/`
-> 重打进 `packages/*.zip`，做 round-trip 断言，并把 zip 里的 `install.bat` 统一成 **CRLF**。
+> 直接跑 `python tools/repack.py`（`--check` 只校验不写入）：自动把安装器 `src/` 和功能载荷 `mods/`
+> 组装进 `packages/*.zip`，做 round-trip 断言，并把 zip 里的 `install.bat` 统一成 **CRLF**。
 > 内嵌载荷的编码约定：把 `setup.ps1` 读成文本 → 去掉已有的 BOM → 换行统一成 **LF** →
 > 按 **UTF-8 带 BOM** 编码 → base64 → 每 **100** 字符一行，包在
 > `-----BEGIN/END CERTIFICATE-----` 之间，每行前缀 `>>"%B64%" echo `。
