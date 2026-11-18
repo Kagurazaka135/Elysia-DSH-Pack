@@ -245,6 +245,56 @@ def wav_to_amr_base64(wav_bytes):
     with open(tmp_mp3, 'rb') as f:
         return base64.b64encode(f.read()).decode()
 
+# ---------- 语音后台合成 (P0-1) ----------
+# tts_wav 是同步 CPU 推理 (CosyVoice2), 以前直接在轮询协程里调用, 合成期间整个
+# asyncio 事件循环停摆: WS 收不到新消息、心跳发不出去、其他回复全排队。改成后台
+# 线程合成: 文字先发, 语音后补, 互不阻塞。同时最多 1 个合成任务, 超出的直接跳过
+# (只记日志, 不排队 —— 排队会让语音越攒越旧, 放出来的时候对话早翻篇了)。
+import asyncio
+import threading
+
+VOICE_PROMPT_WAV = os.path.join(BASE, 'models', 'elysia-voice', 'clips', 'guide-elysia', 'g-05.wav')
+VOICE_PROMPT_TEXT = '作为游客，芽衣只需要负责好好享受这件事就好啦'
+
+_TTS_LOCK = threading.Lock()
+_TTS_BUSY = False
+
+def schedule_voice(ws, uid, reply, group_id=None):
+    """把「合成 -> 发语音」丢到后台线程。合成失败只记日志, 不影响已发出的文字。"""
+    global _TTS_BUSY
+    loop = asyncio.get_running_loop()
+    with _TTS_LOCK:
+        if _TTS_BUSY:
+            log('[语音] 上一个合成还没完成, 本条跳过语音 (仅文字已发)')
+            return
+        _TTS_BUSY = True
+
+    def _work():
+        global _TTS_BUSY
+        try:
+            wav = tts_wav(reply, VOICE_PROMPT_WAV, VOICE_PROMPT_TEXT)
+            # websockets 不是线程安全的, 发送必须回到事件循环去做
+            asyncio.run_coroutine_threadsafe(_send_voice_bg(ws, uid, wav, group_id), loop)
+        except Exception as e:
+            log(f'[语音失败·仅文字已发] {type(e).__name__}: {e}')
+        finally:
+            with _TTS_LOCK:
+                _TTS_BUSY = False
+
+    try:
+        threading.Thread(target=_work, name='elysia-tts', daemon=True).start()
+    except Exception:
+        with _TTS_LOCK:               # 起线程失败 (极罕见) 也要放行下一条, 别永久哑火
+            _TTS_BUSY = False
+        raise
+
+async def _send_voice_bg(ws, uid, wav, group_id):
+    try:
+        await send_voice(ws, uid, wav, group_id)
+        log('[语音] 已发送')
+    except Exception as e:
+        log(f'[语音失败·仅文字已发] {type(e).__name__}: {e}')
+
 # ---------- WS 发送 (支持私聊+群聊) ----------
 async def send_text(ws, user_id, text, group_id=None):
     if group_id:
@@ -307,11 +357,25 @@ async def poll_replies(ws):
     新版桥把回复放在内存队列里, 用递增的毫秒时间戳 id 做游标 —— 不再有「读-清-写」
     竞态, 也不会因为外部程序晚一步启动就丢回复。游标本身存盘, 所以重启分身
     只会补发「没发过的」, 不会把发过的一股脑重发。
+
+    游标语义 (P0-2): since 是「已确认投递」的边界, 只有 send_text 成功后才前进。
+    发送失败就中止本轮、游标留在原地, 下一轮重发这条 —— 宁可重试, 不可越过
+    (先推进再发送 = 连接一断这条回复就永久丢失, 正是修掉的丢消息 bug)。
+    advance() 每推进一次就落盘一次: poll_replies 在断线重连时整个重建、内存里的
+    since 归零重读, 不逐条落盘的话「发成功了一半断线」会把发过的重发一遍。
     """
-    import asyncio
     import urllib.request
     since = load_cursor()
-    saved = since
+
+    def advance(n):
+        """把游标推进到 max(当前, n) 并立刻原子落盘。只允许在跳过条目
+        (空文本/无 uid, 本来就不可能发出去) 或发送成功之后调用。"""
+        nonlocal since
+        target = max(since, n)
+        if target != since:
+            since = target
+            save_cursor(since)
+
     while True:
         try:
             url = f'{REPLY_URL}?token={TOKEN}&since={since}'
@@ -320,35 +384,39 @@ async def poll_replies(ws):
             if not data.get('ok'):
                 log(f'[轮询错误] {data.get("error")}')
             else:
+                aborted = False
                 for r in data.get('replies', []):
-                    since = max(since, r.get('id', 0))
+                    rid = r.get('id', 0)
                     uid = r.get('userId', '')
                     reply = (r.get('text') or '').strip()
                     group_id = r.get('groupId') or None
                     if not uid or not reply:
+                        # 空文本/无 uid: 跳过不算失败, 游标照样推进,
+                        # 不然会永远卡在同一条上反复拉取。
+                        advance(rid)
                         continue
-                    await send_text(ws, uid, reply, group_id)
+                    try:
+                        await send_text(ws, uid, reply, group_id)
+                    except Exception as e:
+                        log(f'[回复发送失败] 第 {rid} 条发送失败（{type(e).__name__}: {e}）, '
+                            f'游标停在 {since} 本轮中止, 下一轮重发这条')
+                        aborted = True
+                        break
+                    advance(rid)
                     log(f'[真身回复→QQ] {uid} (group={group_id}): {reply[:50]}')
-                    # 语音 (只对较短的回复)
+                    # 语音 (只对较短的回复; 合成在后台线程跑, 不卡事件循环)
                     if len(reply) <= 100:
-                        try:
-                            wav = tts_wav(reply,
-                                          os.path.join(BASE, 'models', 'elysia-voice', 'clips', 'guide-elysia', 'g-05.wav'),
-                                          '作为游客，芽衣只需要负责好好享受这件事就好啦')
-                            await send_voice(ws, uid, wav, group_id)
-                            log('[语音] 已发送')
-                        except Exception as e:
-                            log(f'[语音失败·仅文字已发] {type(e).__name__}: {e}')
+                        schedule_voice(ws, uid, reply, group_id)
                     # 完成后通知 (done.json 兼容旧汇报); 封顶 200 条, 别无限涨
                     done = load_json(DONE)
                     done.append({'result': reply, 'time': time.strftime('%H:%M')})
                     save_json(DONE, done[-200:])
-                since = max(since, data.get('nextId', 0))
+                if not aborted:
+                    # 整批处理完才吃掉 nextId; 中途失败必须留在失败那条之前,
+                    # 否则失败那条就在服务端队列里永远取不到了。
+                    advance(data.get('nextId', 0))
         except Exception as e:
             log(f'[轮询错误] {e}')
-        if since != saved:
-            save_cursor(since)
-            saved = since
         await asyncio.sleep(2)
 
 # 消息去重: 同一用户 10 秒内相同文本只处理一次 (NapCat 会重复推送)

@@ -152,6 +152,9 @@ export function apply(ctx, config) {
   /** 待外部取走的回复。 */
   const replies = []
   let lastReplyId = 0
+  /** 本插件启动以来因溢出被丢弃的回复累计条数（丢最旧策略的代价）。
+   *  经 /api/qq/replies 响应的 dropped 字段外露，供 Python 侧核对有无丢失。 */
+  let droppedReplies = 0
 
   // ── A1 单源：白名单/口令以 qq-config.json 为唯一真源 ──────────────────────
   // 分身（Python）、NapCat（onebot11.json）、安装脚本都读写同一个文件；以前插件
@@ -363,7 +366,14 @@ export function apply(ctx, config) {
       text,
       at: Date.now(),
     })
-    if (replies.length > config.replyBuffer) replies.splice(0, replies.length - config.replyBuffer)
+    if (replies.length > config.replyBuffer) {
+      // 溢出丢最旧（既定取舍：不丢最新、不阻塞注入），但必须留痕 —— 以前是静默
+      // splice，Python 侧停机/轮询失败期间第 N 条以后的回复无痕消失，事后无从查证。
+      const dropped = replies.splice(0, replies.length - config.replyBuffer)
+      droppedReplies += dropped.length
+      log.warn(`[qq-bridge] 回复队列溢出（上限 ${config.replyBuffer}）：丢弃最旧 ${dropped.length} 条`
+        + `（id ${dropped[0].id}~${dropped[dropped.length - 1].id}），累计丢弃 ${droppedReplies} 条`)
+    }
     log.info(`[qq-bridge] ${userId} 的回复已入队（id ${id}，${text.length} 字）`)
   }
 
@@ -524,7 +534,8 @@ export function apply(ctx, config) {
       const since = Number(url.searchParams.get('since') ?? '0')
       const from = Number.isFinite(since) && since > 0 ? since : 0
       const batch = replies.filter(r => r.id > from)
-      sendJson(res, 200, { ok: true, replies: batch, nextId: lastReplyId, nextSeq: lastReplyId })
+      // dropped 只新增字段：累计丢弃条数（0 = 没丢过），旧客户端照常解析。
+      sendJson(res, 200, { ok: true, replies: batch, nextId: lastReplyId, nextSeq: lastReplyId, dropped: droppedReplies })
     },
   }), 'qq-bridge: replies route')
 
